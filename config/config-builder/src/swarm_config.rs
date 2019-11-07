@@ -365,6 +365,7 @@ impl SwarmConfig {
         };
         NodeConfigHelpers::randomize_config_ports(&mut config);
         config.admission_control.admission_control_service_port = 33333;
+        config.consensus.proposer_type = "fixed_proposer".to_string();
         config.vm_config.publishing_options = VMPublishingOption::Open;
         config
     }
