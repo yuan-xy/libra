@@ -364,6 +364,7 @@ impl SwarmConfig {
             vm_config: template.vm_config.clone(),
         };
         NodeConfigHelpers::randomize_config_ports(&mut config);
+        config.admission_control.admission_control_service_port = 33333;
         config.vm_config.publishing_options = VMPublishingOption::Open;
         config
     }
