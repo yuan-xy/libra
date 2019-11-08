@@ -174,7 +174,7 @@ impl Default for MetricsConfig {
     fn default() -> MetricsConfig {
         MetricsConfig {
             dir: PathBuf::from("metrics"),
-            collection_interval_ms: 1000,
+            collection_interval_ms: 100000,
             push_server_addr: "".to_string(),
         }
     }
