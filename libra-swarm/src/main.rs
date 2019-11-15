@@ -37,7 +37,7 @@ fn main() {
     let num_nodes = args.num_nodes;
     let num_full_nodes = args.num_full_nodes;
     let (faucet_account_keypair, faucet_key_file_path, _temp_dir) =
-        generate_keypair::load_faucet_key_or_create_default(None);
+        generate_keypair::load_faucet_key_or_create_default(Some("faucet_key_for_test".to_string()));
 
     println!(
         "Faucet account created in (loaded from) file {:?}",

@@ -299,7 +299,7 @@ impl NodeConfigHelpers {
     }
 
     pub fn randomize_config_ports(config: &mut NodeConfig) {
-        config.admission_control.admission_control_service_port = get_available_port();
+        config.admission_control.admission_control_service_port = 33333;
         config.debug_interface.admission_control_node_debug_port = get_available_port();
         config.debug_interface.metrics_server_port = get_available_port();
         config.debug_interface.public_metrics_server_port = get_available_port();
