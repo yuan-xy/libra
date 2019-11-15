@@ -102,6 +102,7 @@ impl<T: Payload> ChainedBftSMR<T> {
         let fut = async move {
             event_processor.start().await;
             loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
                 let pre_select_instant = Instant::now();
                 let idle_duration;
                 select! {
