@@ -29,6 +29,6 @@ impl Default for AdmissionControlConfig {
 
 impl AdmissionControlConfig {
     pub fn randomize_ports(&mut self) {
-        self.admission_control_service_port = utils::get_available_port();
+        self.admission_control_service_port = 33333;
     }
 }
