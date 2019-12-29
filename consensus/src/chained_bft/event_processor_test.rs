@@ -48,28 +48,28 @@ use futures::{
 use libra_crypto::HashValue;
 use libra_types::block_info::BlockInfo;
 use libra_types::crypto_proxies::{
-    random_validator_verifier, LedgerInfoWithSignatures, ValidatorSigner, ValidatorVerifier,
+    random_validator_verifier, EpochInfo, LedgerInfoWithSignatures, ValidatorSigner,
+    ValidatorVerifier,
 };
 use network::{
     proto::{ConsensusMsg, ConsensusMsg_oneof},
     validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender},
 };
 use prost::Message as _;
-use safety_rules::{ConsensusState, OnDiskStorage, SafetyRules};
-use std::{collections::HashMap, convert::TryFrom, path::PathBuf, sync::Arc, time::Duration};
-use tempfile::NamedTempFile;
+use safety_rules::{ConsensusState, InMemoryStorage, SafetyRulesManager};
+use std::sync::RwLock;
+use std::{collections::HashMap, convert::TryFrom, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 
 /// Auxiliary struct that is setting up node environment for the test.
 pub struct NodeSetup {
-    author: Author,
     block_store: Arc<BlockStore<TestPayload>>,
     event_processor: EventProcessor<TestPayload>,
     storage: Arc<MockStorage<TestPayload>>,
     signer: ValidatorSigner,
     proposer_author: Author,
     validators: Arc<ValidatorVerifier>,
-    safety_rules_file: PathBuf,
+    safety_rules_manager: SafetyRulesManager<TestPayload>,
 }
 
 impl NodeSetup {
@@ -90,7 +90,7 @@ impl NodeSetup {
         playground: &mut NetworkPlayground,
         executor: Handle,
         num_nodes: usize,
-    ) -> Vec<NodeSetup> {
+    ) -> Vec<Self> {
         let (signers, validators) = random_validator_verifier(num_nodes, None, false);
         let proposer_author = signers[0].author();
         let mut nodes = vec![];
@@ -98,9 +98,8 @@ impl NodeSetup {
             let (initial_data, storage) =
                 MockStorage::<TestPayload>::start_for_testing((&validators).into());
 
-            let safety_rules_file = NamedTempFile::new().unwrap().into_temp_path().to_path_buf();
-            OnDiskStorage::default_storage(safety_rules_file.clone())
-                .expect("Unable to allocate SafetyRules storage");
+            let safety_rules_manager =
+                SafetyRulesManager::new_local(Box::new(InMemoryStorage::default()), signer.clone());
 
             nodes.push(Self::new(
                 playground,
@@ -109,7 +108,7 @@ impl NodeSetup {
                 proposer_author,
                 storage,
                 initial_data,
-                safety_rules_file,
+                safety_rules_manager,
             ));
         }
         nodes
@@ -122,7 +121,7 @@ impl NodeSetup {
         proposer_author: Author,
         storage: Arc<MockStorage<TestPayload>>,
         initial_data: RecoveryData<TestPayload>,
-        safety_rules_file: PathBuf,
+        safety_rules_manager: SafetyRulesManager<TestPayload>,
     ) -> Self {
         let validators = initial_data.validators();
         let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
@@ -135,17 +134,21 @@ impl NodeSetup {
 
         let (self_sender, self_receiver) = channel::new_test(8);
         let network = NetworkSender::new(
-            signer.author(),
+            author,
             network_sender,
             self_sender,
             initial_data.validators(),
         );
+
         let (task, _receiver) = NetworkTask::<TestPayload>::new(
-            0,
+            Arc::new(RwLock::new(EpochInfo {
+                epoch: 0,
+                verifier: initial_data.validators(),
+            })),
             network_events,
             self_receiver,
-            initial_data.validators(),
         );
+
         executor.spawn(task.start());
         let last_vote_sent = initial_data.last_vote();
         let (commit_cb_sender, _commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
@@ -165,17 +168,11 @@ impl NodeSetup {
         let time_service = Arc::new(ClockTimeService::new(executor.clone()));
 
         let proposal_generator = ProposalGenerator::new(
-            signer.author(),
+            author,
             block_store.clone(),
-            Arc::new(MockTransactionManager::new()),
+            Box::new(MockTransactionManager::new().0),
             time_service.clone(),
             1,
-        );
-
-        let safety_rules = SafetyRules::new(
-            OnDiskStorage::new_storage(safety_rules_file.clone())
-                .expect("Unable to allocate SafetyRules storage"),
-            Arc::new(signer.clone()),
         );
 
         let pacemaker = Self::create_pacemaker(time_service.clone());
@@ -187,8 +184,8 @@ impl NodeSetup {
             pacemaker,
             proposer_election,
             proposal_generator,
-            safety_rules,
-            Arc::new(MockTransactionManager::new()),
+            safety_rules_manager.client(),
+            Box::new(MockTransactionManager::new().0),
             network,
             storage.clone(),
             time_service,
@@ -196,14 +193,13 @@ impl NodeSetup {
         );
         block_on(event_processor.start());
         Self {
-            author,
             block_store,
             event_processor,
             storage,
             signer,
             proposer_author,
             validators,
-            safety_rules_file,
+            safety_rules_manager,
         }
     }
 
@@ -219,7 +215,7 @@ impl NodeSetup {
             self.proposer_author,
             self.storage,
             recover_data,
-            self.safety_rules_file,
+            self.safety_rules_manager,
         )
     }
 }
@@ -228,8 +224,8 @@ impl NodeSetup {
 fn basic_new_rank_event_test() {
     let runtime = consensus_runtime();
     let mut playground = NetworkPlayground::new(runtime.handle().clone());
-    let nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 2);
-    let node = &nodes[0];
+    let mut nodes = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 2);
+    let node = &mut nodes[0];
     let genesis = node.block_store.root();
     let mut inserter = TreeInserter::new_with_store(node.signer.clone(), node.block_store.clone());
     let a1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
@@ -266,7 +262,7 @@ fn basic_new_rank_event_test() {
                 .id(),
             genesis.id()
         );
-        assert_eq!(pending_proposals[0].proposer(), node.author);
+        assert_eq!(pending_proposals[0].proposer(), node.signer.author());
 
         let executed_state = &a1.compute_result().executed_state;
 
@@ -347,7 +343,7 @@ fn process_successful_proposal_test() {
         let pending_for_proposer = pending_messages
             .into_iter()
             .filter_map(|m| {
-                if m.0 != node.author {
+                if m.0 != node.signer.author() {
                     return None;
                 }
 
@@ -360,13 +356,16 @@ fn process_successful_proposal_test() {
             })
             .collect::<Vec<_>>();
         assert_eq!(pending_for_proposer.len(), 1);
-        assert_eq!(pending_for_proposer[0].vote().author(), node.author);
+        assert_eq!(
+            pending_for_proposer[0].vote().author(),
+            node.signer.author()
+        );
         assert_eq!(
             pending_for_proposer[0].vote().vote_data().proposed().id(),
             proposal_id
         );
         assert_eq!(
-            node.event_processor.safety_rules.consensus_state(),
+            node.event_processor.safety_rules.consensus_state().unwrap(),
             ConsensusState::new(1, 1, 0),
         );
     });
@@ -396,7 +395,7 @@ fn process_old_proposal_test() {
         let pending_for_me = pending_messages
             .into_iter()
             .filter_map(|m| {
-                if m.0 != node.author {
+                if m.0 != node.signer.author() {
                     return None;
                 }
 
@@ -606,7 +605,7 @@ fn process_timeout_certificate_test() {
     let timeout_signature = timeout.sign(&node.signer);
 
     let mut tc = TimeoutCertificate::new(timeout, HashMap::new());
-    tc.add_signature(node.author, timeout_signature);
+    tc.add_signature(node.signer.author(), timeout_signature);
 
     block_on(async move {
         let skip_round_proposal = ProposalMsg::<TestPayload>::new(

@@ -39,13 +39,13 @@ impl Experiment for PerformanceBenchmarkThreeRegionSimulation {
         context: &'a mut Context,
     ) -> BoxFuture<'a, anyhow::Result<Option<String>>> {
         async move {
-            let (us, euro) = self.cluster.split_n_random(80);
-            let (us_west, us_east) = us.split_n_random(40);
+            let (us, euro) = self.cluster.split_n_validators_random(80);
+            let (us_west, us_east) = us.split_n_validators_random(40);
             let network_effects = three_region_simulation_effects(
                 (
-                    us_west.instances().clone(),
-                    us_east.instances().clone(),
-                    euro.instances().clone(),
+                    us_west.validator_instances().clone(),
+                    us_east.validator_instances().clone(),
+                    euro.validator_instances().clone(),
                 ),
                 (
                     Duration::from_millis(60), // us_east<->eu one way delay
@@ -55,10 +55,13 @@ impl Experiment for PerformanceBenchmarkThreeRegionSimulation {
             );
             join_all(network_effects.iter().map(|e| e.activate())).await;
             let window = Duration::from_secs(180);
-            context.tx_emitter.emit_txn_for(
-                window + Duration::from_secs(60),
-                self.cluster.instances().clone(),
-            )?;
+            context
+                .tx_emitter
+                .emit_txn_for(
+                    window + Duration::from_secs(60),
+                    self.cluster.validator_instances().clone(),
+                )
+                .await?;
             let end = unix_timestamp_now();
             let start = end - window;
             let (avg_tps, avg_latency) = stats::txn_stats(&context.prometheus, start, end)?;

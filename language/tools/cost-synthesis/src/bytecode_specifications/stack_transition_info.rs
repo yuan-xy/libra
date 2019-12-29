@@ -68,13 +68,20 @@ impl SignatureTy {
 lazy_static! {
     static ref BASE_SIG_TOKENS: Vec<SignatureToken> = vec![
         SignatureToken::Bool,
+        SignatureToken::U8,
         SignatureToken::U64,
-        SignatureToken::String,
+        SignatureToken::U128,
         SignatureToken::ByteArray,
         SignatureToken::Address,
         // Bogus struct handle index, but it's fine since we disregard this in the generation of
         // instruction arguments.
         SignatureToken::Struct(StructHandleIndex::new(0), vec![]),
+    ];
+
+    static ref INTEGER_SIG_TOKENS: Vec<SignatureToken> = vec![
+        SignatureToken::U8,
+        SignatureToken::U64,
+        SignatureToken::U128,
     ];
 }
 
@@ -118,21 +125,27 @@ fn bools(num: u64) -> Vec<SignatureTy> {
         .collect()
 }
 
+fn u8s(num: u64) -> Vec<SignatureTy> {
+    (0..num)
+        .map(|_| ty_of_sig_tok(SignatureToken::U8))
+        .collect()
+}
+
 fn u64s(num: u64) -> Vec<SignatureTy> {
     (0..num)
         .map(|_| ty_of_sig_tok(SignatureToken::U64))
         .collect()
 }
 
-fn simple_addrs(num: u64) -> Vec<SignatureTy> {
+fn u128s(num: u64) -> Vec<SignatureTy> {
     (0..num)
-        .map(|_| ty_of_sig_tok(SignatureToken::Address))
+        .map(|_| ty_of_sig_tok(SignatureToken::U128))
         .collect()
 }
 
-fn strs(num: u64) -> Vec<SignatureTy> {
+fn simple_addrs(num: u64) -> Vec<SignatureTy> {
     (0..num)
-        .map(|_| ty_of_sig_tok(SignatureToken::String))
+        .map(|_| ty_of_sig_tok(SignatureToken::Address))
         .collect()
 }
 
@@ -152,6 +165,13 @@ fn values(num: u64) -> Vec<SignatureTy> {
 // creates `num` rows of a single type. Used for Eq and Neq
 fn non_variable_values(num: u64) -> Vec<Vec<SignatureTy>> {
     BASE_SIG_TOKENS
+        .iter()
+        .map(|ty| (0..num).map(|_| ty_of_sig_tok(ty.clone())).collect())
+        .collect()
+}
+
+fn integer_values(num: u64) -> Vec<Vec<SignatureTy>> {
+    INTEGER_SIG_TOKENS
         .iter()
         .map(|ty| (0..num).map(|_| ty_of_sig_tok(ty.clone())).collect())
         .collect()
@@ -194,7 +214,23 @@ pub fn call_details(op: &Bytecode) -> Vec<CallDetails> {
         | Bytecode::Div
         | Bytecode::BitOr
         | Bytecode::BitAnd
-        | Bytecode::Xor => type_transition! { u64s(2) => u64s(1) },
+        | Bytecode::Xor => type_transition! {
+            u8s(2) => u8s(1),
+            u64s(2) => u64s(1),
+            u128s(2) => u128s(1)
+        },
+        // TODO: rewrite in a more efficient way.
+        Bytecode::Shl | Bytecode::Shr => type_transition! {
+            vec![ty_of_sig_tok(SignatureToken::U8), ty_of_sig_tok(SignatureToken::U8)] => u8s(1),
+            vec![ty_of_sig_tok(SignatureToken::U8), ty_of_sig_tok(SignatureToken::U64)] => u8s(1),
+            vec![ty_of_sig_tok(SignatureToken::U8), ty_of_sig_tok(SignatureToken::U128)] => u8s(1),
+            vec![ty_of_sig_tok(SignatureToken::U64), ty_of_sig_tok(SignatureToken::U8)] => u64s(1),
+            vec![ty_of_sig_tok(SignatureToken::U64), ty_of_sig_tok(SignatureToken::U64)] => u64s(1),
+            vec![ty_of_sig_tok(SignatureToken::U64), ty_of_sig_tok(SignatureToken::U128)] => u64s(1),
+            vec![ty_of_sig_tok(SignatureToken::U128), ty_of_sig_tok(SignatureToken::U8)] => u128s(1),
+            vec![ty_of_sig_tok(SignatureToken::U128), ty_of_sig_tok(SignatureToken::U64)] => u128s(1),
+            vec![ty_of_sig_tok(SignatureToken::U128), ty_of_sig_tok(SignatureToken::U128)] => u128s(1)
+        },
         Bytecode::Eq | Bytecode::Neq => type_transition! {
             fixed: non_variable_values(2) => bools(1)
         },
@@ -203,10 +239,14 @@ pub fn call_details(op: &Bytecode) -> Vec<CallDetails> {
             ref_values(1) => empty(),
             ref_resources(1) => empty()
         },
-        Bytecode::LdConst(_) => type_transition! { empty() => u64s(1) },
+        Bytecode::LdU8(_) => type_transition! { empty() => u8s(1) },
+        Bytecode::LdU64(_) => type_transition! { empty() => u64s(1) },
+        Bytecode::LdU128(_) => type_transition! { empty() => u128s(1) },
+        Bytecode::CastU8 => type_transition! { fixed: integer_values(1) => u8s(1) },
+        Bytecode::CastU64 => type_transition! { fixed: integer_values(1) => u64s(1) },
+        Bytecode::CastU128 => type_transition! { fixed: integer_values(1) => u128s(1) },
         Bytecode::LdAddr(_) => type_transition! { empty() => simple_addrs(1) },
         Bytecode::LdByteArray(_) => type_transition! { empty() => byte_arrays(1) },
-        Bytecode::LdStr(_) => type_transition! { empty() => strs(1) },
         Bytecode::LdFalse | Bytecode::LdTrue => type_transition! { empty() => bools(1) },
         Bytecode::BrTrue(_) | Bytecode::BrFalse(_) => {
             type_transition! { bools(1) => empty() }
@@ -242,7 +282,7 @@ pub fn call_details(op: &Bytecode) -> Vec<CallDetails> {
             }
         }
         Bytecode::Lt | Bytecode::Gt | Bytecode::Le | Bytecode::Ge => {
-            type_transition! { u64s(2) => bools(1) }
+            type_transition! { fixed: integer_values(2) => bools(1) }
         }
         Bytecode::And | Bytecode::Or => type_transition! { bools(2) => bools(1) },
         Bytecode::Not => type_transition! { bools(1) => bools(1) },

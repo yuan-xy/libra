@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{errors::*, file_format::*, file_format_common::*, vm_string::VMString};
+use crate::{errors::*, file_format::*, file_format_common::*};
 use byteorder::{LittleEndian, ReadBytesExt};
 use libra_types::{
     account_address::ADDRESS_LENGTH,
@@ -202,7 +202,6 @@ trait CommonTables {
     fn get_locals_signatures(&mut self) -> &mut LocalsSignaturePool;
 
     fn get_identifiers(&mut self) -> &mut IdentifierPool;
-    fn get_user_strings(&mut self) -> &mut UserStringPool;
     fn get_byte_array_pool(&mut self) -> &mut ByteArrayPool;
     fn get_address_pool(&mut self) -> &mut AddressPool;
 }
@@ -234,10 +233,6 @@ impl CommonTables for CompiledScriptMut {
 
     fn get_identifiers(&mut self) -> &mut IdentifierPool {
         &mut self.identifiers
-    }
-
-    fn get_user_strings(&mut self) -> &mut UserStringPool {
-        &mut self.user_strings
     }
 
     fn get_byte_array_pool(&mut self) -> &mut ByteArrayPool {
@@ -276,10 +271,6 @@ impl CommonTables for CompiledModuleMut {
 
     fn get_identifiers(&mut self) -> &mut IdentifierPool {
         &mut self.identifiers
-    }
-
-    fn get_user_strings(&mut self) -> &mut UserStringPool {
-        &mut self.user_strings
     }
 
     fn get_byte_array_pool(&mut self) -> &mut ByteArrayPool {
@@ -330,9 +321,6 @@ fn build_common_tables(
             TableType::IDENTIFIERS => {
                 load_identifiers(binary, table, common.get_identifiers())?;
             }
-            TableType::USER_STRINGS => {
-                load_user_strings(binary, table, common.get_user_strings())?;
-            }
             TableType::BYTE_ARRAY_POOL => {
                 load_byte_array_pool(binary, table, common.get_byte_array_pool())?;
             }
@@ -376,7 +364,6 @@ fn build_module_tables(
             | TableType::FUNCTION_HANDLES
             | TableType::ADDRESS_POOL
             | TableType::IDENTIFIERS
-            | TableType::USER_STRINGS
             | TableType::BYTE_ARRAY_POOL
             | TableType::TYPE_SIGNATURES
             | TableType::FUNCTION_SIGNATURES
@@ -411,7 +398,6 @@ fn build_script_tables(
             | TableType::FUNCTION_HANDLES
             | TableType::ADDRESS_POOL
             | TableType::IDENTIFIERS
-            | TableType::USER_STRINGS
             | TableType::BYTE_ARRAY_POOL
             | TableType::TYPE_SIGNATURES
             | TableType::FUNCTION_SIGNATURES
@@ -552,34 +538,6 @@ fn load_identifiers(
     Ok(())
 }
 
-/// Builds the `UserStringPool`.
-fn load_user_strings(
-    binary: &[u8],
-    table: &Table,
-    user_strings: &mut UserStringPool,
-) -> BinaryLoaderResult<()> {
-    let start = table.offset as usize;
-    let end = start + table.count as usize;
-    let mut cursor = Cursor::new(&binary[start..end]);
-    while cursor.position() < u64::from(table.count) {
-        let size = read_uleb_u32_internal(&mut cursor)? as usize;
-        if size > std::u16::MAX as usize {
-            return Err(VMStatus::new(StatusCode::MALFORMED));
-        }
-        let mut buffer: Vec<u8> = vec![0u8; size];
-        if let Ok(count) = cursor.read(&mut buffer) {
-            if count != size {
-                return Err(VMStatus::new(StatusCode::MALFORMED));
-            }
-            let us =
-                VMString::from_utf8(buffer).map_err(|_| VMStatus::new(StatusCode::MALFORMED))?;
-
-            user_strings.push(us);
-        }
-    }
-    Ok(())
-}
-
 /// Builds the `ByteArrayPool`.
 fn load_byte_array_pool(
     binary: &[u8],
@@ -707,8 +665,9 @@ fn load_signature_token(cursor: &mut Cursor<&[u8]>) -> BinaryLoaderResult<Signat
     if let Ok(byte) = cursor.read_u8() {
         match SerializedType::from_u8(byte)? {
             SerializedType::BOOL => Ok(SignatureToken::Bool),
-            SerializedType::INTEGER => Ok(SignatureToken::U64),
-            SerializedType::STRING => Ok(SignatureToken::String),
+            SerializedType::U8 => Ok(SignatureToken::U8),
+            SerializedType::U64 => Ok(SignatureToken::U64),
+            SerializedType::U128 => Ok(SignatureToken::U128),
             SerializedType::BYTEARRAY => Ok(SignatureToken::ByteArray),
             SerializedType::ADDRESS => Ok(SignatureToken::Address),
             SerializedType::REFERENCE => {
@@ -926,17 +885,26 @@ fn load_code(cursor: &mut Cursor<&[u8]>, code: &mut Vec<Bytecode>) -> BinaryLoad
                 let jump = read_u16_internal(cursor)?;
                 Bytecode::Branch(jump)
             }
-            Opcodes::LD_CONST => {
-                let value = read_u64_internal(cursor)?;
-                Bytecode::LdConst(value)
+            Opcodes::LD_U8 => {
+                let value = cursor
+                    .read_u8()
+                    .map_err(|_| VMStatus::new(StatusCode::MALFORMED))?;
+                Bytecode::LdU8(value)
             }
+            Opcodes::LD_U64 => {
+                let value = read_u64_internal(cursor)?;
+                Bytecode::LdU64(value)
+            }
+            Opcodes::LD_U128 => {
+                let value = read_u128_internal(cursor)?;
+                Bytecode::LdU128(value)
+            }
+            Opcodes::CAST_U8 => Bytecode::CastU8,
+            Opcodes::CAST_U64 => Bytecode::CastU64,
+            Opcodes::CAST_U128 => Bytecode::CastU128,
             Opcodes::LD_ADDR => {
                 let idx = read_uleb_u16_internal(cursor)?;
                 Bytecode::LdAddr(AddressPoolIndex(idx))
-            }
-            Opcodes::LD_STR => {
-                let idx = read_uleb_u16_internal(cursor)?;
-                Bytecode::LdStr(UserStringIndex(idx))
             }
             Opcodes::LD_TRUE => Bytecode::LdTrue,
             Opcodes::LD_FALSE => Bytecode::LdFalse,
@@ -1007,6 +975,8 @@ fn load_code(cursor: &mut Cursor<&[u8]>, code: &mut Vec<Bytecode>) -> BinaryLoad
             Opcodes::BIT_OR => Bytecode::BitOr,
             Opcodes::BIT_AND => Bytecode::BitAnd,
             Opcodes::XOR => Bytecode::Xor,
+            Opcodes::SHL => Bytecode::Shl,
+            Opcodes::SHR => Bytecode::Shr,
             Opcodes::OR => Bytecode::Or,
             Opcodes::AND => Bytecode::And,
             Opcodes::NOT => Bytecode::Not,
@@ -1091,6 +1061,12 @@ fn read_u64_internal(cursor: &mut Cursor<&[u8]>) -> BinaryLoaderResult<u64> {
         .map_err(|_| VMStatus::new(StatusCode::MALFORMED))
 }
 
+fn read_u128_internal(cursor: &mut Cursor<&[u8]>) -> BinaryLoaderResult<u128> {
+    cursor
+        .read_u128::<LittleEndian>()
+        .map_err(|_| VMStatus::new(StatusCode::MALFORMED))
+}
+
 impl TableType {
     fn from_u8(value: u8) -> BinaryLoaderResult<TableType> {
         match value {
@@ -1099,15 +1075,14 @@ impl TableType {
             0x3 => Ok(TableType::FUNCTION_HANDLES),
             0x4 => Ok(TableType::ADDRESS_POOL),
             0x5 => Ok(TableType::IDENTIFIERS),
-            0x6 => Ok(TableType::USER_STRINGS),
-            0x7 => Ok(TableType::BYTE_ARRAY_POOL),
-            0x8 => Ok(TableType::MAIN),
-            0x9 => Ok(TableType::STRUCT_DEFS),
-            0xA => Ok(TableType::FIELD_DEFS),
-            0xB => Ok(TableType::FUNCTION_DEFS),
-            0xC => Ok(TableType::TYPE_SIGNATURES),
-            0xD => Ok(TableType::FUNCTION_SIGNATURES),
-            0xE => Ok(TableType::LOCALS_SIGNATURES),
+            0x6 => Ok(TableType::BYTE_ARRAY_POOL),
+            0x7 => Ok(TableType::MAIN),
+            0x8 => Ok(TableType::STRUCT_DEFS),
+            0x9 => Ok(TableType::FIELD_DEFS),
+            0xA => Ok(TableType::FUNCTION_DEFS),
+            0xB => Ok(TableType::TYPE_SIGNATURES),
+            0xC => Ok(TableType::FUNCTION_SIGNATURES),
+            0xD => Ok(TableType::LOCALS_SIGNATURES),
             _ => Err(VMStatus::new(StatusCode::UNKNOWN_TABLE_TYPE)),
         }
     }
@@ -1129,14 +1104,15 @@ impl SerializedType {
     fn from_u8(value: u8) -> BinaryLoaderResult<SerializedType> {
         match value {
             0x1 => Ok(SerializedType::BOOL),
-            0x2 => Ok(SerializedType::INTEGER),
-            0x3 => Ok(SerializedType::STRING),
-            0x4 => Ok(SerializedType::ADDRESS),
-            0x5 => Ok(SerializedType::REFERENCE),
-            0x6 => Ok(SerializedType::MUTABLE_REFERENCE),
-            0x7 => Ok(SerializedType::STRUCT),
-            0x8 => Ok(SerializedType::BYTEARRAY),
-            0x9 => Ok(SerializedType::TYPE_PARAMETER),
+            0x2 => Ok(SerializedType::U8),
+            0x3 => Ok(SerializedType::U64),
+            0x4 => Ok(SerializedType::U128),
+            0x5 => Ok(SerializedType::ADDRESS),
+            0x6 => Ok(SerializedType::REFERENCE),
+            0x7 => Ok(SerializedType::MUTABLE_REFERENCE),
+            0x8 => Ok(SerializedType::STRUCT),
+            0x9 => Ok(SerializedType::BYTEARRAY),
+            0xA => Ok(SerializedType::TYPE_PARAMETER),
             _ => Err(VMStatus::new(StatusCode::UNKNOWN_SERIALIZED_TYPE)),
         }
     }
@@ -1181,54 +1157,60 @@ impl Opcodes {
             0x03 => Ok(Opcodes::BR_TRUE),
             0x04 => Ok(Opcodes::BR_FALSE),
             0x05 => Ok(Opcodes::BRANCH),
-            0x06 => Ok(Opcodes::LD_CONST),
+            0x06 => Ok(Opcodes::LD_U64),
             0x07 => Ok(Opcodes::LD_ADDR),
-            0x08 => Ok(Opcodes::LD_STR),
-            0x09 => Ok(Opcodes::LD_TRUE),
-            0x0A => Ok(Opcodes::LD_FALSE),
-            0x0B => Ok(Opcodes::COPY_LOC),
-            0x0C => Ok(Opcodes::MOVE_LOC),
-            0x0D => Ok(Opcodes::ST_LOC),
-            0x0E => Ok(Opcodes::MUT_BORROW_LOC),
-            0x0F => Ok(Opcodes::IMM_BORROW_LOC),
-            0x10 => Ok(Opcodes::MUT_BORROW_FIELD),
-            0x11 => Ok(Opcodes::IMM_BORROW_FIELD),
-            0x12 => Ok(Opcodes::LD_BYTEARRAY),
-            0x13 => Ok(Opcodes::CALL),
-            0x14 => Ok(Opcodes::PACK),
-            0x15 => Ok(Opcodes::UNPACK),
-            0x16 => Ok(Opcodes::READ_REF),
-            0x17 => Ok(Opcodes::WRITE_REF),
-            0x18 => Ok(Opcodes::ADD),
-            0x19 => Ok(Opcodes::SUB),
-            0x1A => Ok(Opcodes::MUL),
-            0x1B => Ok(Opcodes::MOD),
-            0x1C => Ok(Opcodes::DIV),
-            0x1D => Ok(Opcodes::BIT_OR),
-            0x1E => Ok(Opcodes::BIT_AND),
-            0x1F => Ok(Opcodes::XOR),
-            0x20 => Ok(Opcodes::OR),
-            0x21 => Ok(Opcodes::AND),
-            0x22 => Ok(Opcodes::NOT),
-            0x23 => Ok(Opcodes::EQ),
-            0x24 => Ok(Opcodes::NEQ),
-            0x25 => Ok(Opcodes::LT),
-            0x26 => Ok(Opcodes::GT),
-            0x27 => Ok(Opcodes::LE),
-            0x28 => Ok(Opcodes::GE),
-            0x29 => Ok(Opcodes::ABORT),
-            0x2A => Ok(Opcodes::GET_TXN_GAS_UNIT_PRICE),
-            0x2B => Ok(Opcodes::GET_TXN_MAX_GAS_UNITS),
-            0x2C => Ok(Opcodes::GET_GAS_REMAINING),
-            0x2D => Ok(Opcodes::GET_TXN_SENDER),
-            0x2E => Ok(Opcodes::EXISTS),
-            0x2F => Ok(Opcodes::MUT_BORROW_GLOBAL),
-            0x30 => Ok(Opcodes::IMM_BORROW_GLOBAL),
-            0x31 => Ok(Opcodes::MOVE_FROM),
-            0x32 => Ok(Opcodes::MOVE_TO),
-            0x33 => Ok(Opcodes::GET_TXN_SEQUENCE_NUMBER),
-            0x34 => Ok(Opcodes::GET_TXN_PUBLIC_KEY),
-            0x35 => Ok(Opcodes::FREEZE_REF),
+            0x08 => Ok(Opcodes::LD_TRUE),
+            0x09 => Ok(Opcodes::LD_FALSE),
+            0x0A => Ok(Opcodes::COPY_LOC),
+            0x0B => Ok(Opcodes::MOVE_LOC),
+            0x0C => Ok(Opcodes::ST_LOC),
+            0x0D => Ok(Opcodes::MUT_BORROW_LOC),
+            0x0E => Ok(Opcodes::IMM_BORROW_LOC),
+            0x0F => Ok(Opcodes::MUT_BORROW_FIELD),
+            0x10 => Ok(Opcodes::IMM_BORROW_FIELD),
+            0x11 => Ok(Opcodes::LD_BYTEARRAY),
+            0x12 => Ok(Opcodes::CALL),
+            0x13 => Ok(Opcodes::PACK),
+            0x14 => Ok(Opcodes::UNPACK),
+            0x15 => Ok(Opcodes::READ_REF),
+            0x16 => Ok(Opcodes::WRITE_REF),
+            0x17 => Ok(Opcodes::ADD),
+            0x18 => Ok(Opcodes::SUB),
+            0x19 => Ok(Opcodes::MUL),
+            0x1A => Ok(Opcodes::MOD),
+            0x1B => Ok(Opcodes::DIV),
+            0x1C => Ok(Opcodes::BIT_OR),
+            0x1D => Ok(Opcodes::BIT_AND),
+            0x1E => Ok(Opcodes::XOR),
+            0x1F => Ok(Opcodes::OR),
+            0x20 => Ok(Opcodes::AND),
+            0x21 => Ok(Opcodes::NOT),
+            0x22 => Ok(Opcodes::EQ),
+            0x23 => Ok(Opcodes::NEQ),
+            0x24 => Ok(Opcodes::LT),
+            0x25 => Ok(Opcodes::GT),
+            0x26 => Ok(Opcodes::LE),
+            0x27 => Ok(Opcodes::GE),
+            0x28 => Ok(Opcodes::ABORT),
+            0x29 => Ok(Opcodes::GET_TXN_GAS_UNIT_PRICE),
+            0x2A => Ok(Opcodes::GET_TXN_MAX_GAS_UNITS),
+            0x2B => Ok(Opcodes::GET_GAS_REMAINING),
+            0x2C => Ok(Opcodes::GET_TXN_SENDER),
+            0x2D => Ok(Opcodes::EXISTS),
+            0x2E => Ok(Opcodes::MUT_BORROW_GLOBAL),
+            0x2F => Ok(Opcodes::IMM_BORROW_GLOBAL),
+            0x30 => Ok(Opcodes::MOVE_FROM),
+            0x31 => Ok(Opcodes::MOVE_TO),
+            0x32 => Ok(Opcodes::GET_TXN_SEQUENCE_NUMBER),
+            0x33 => Ok(Opcodes::GET_TXN_PUBLIC_KEY),
+            0x34 => Ok(Opcodes::FREEZE_REF),
+            0x35 => Ok(Opcodes::SHL),
+            0x36 => Ok(Opcodes::SHR),
+            0x37 => Ok(Opcodes::LD_U8),
+            0x38 => Ok(Opcodes::LD_U128),
+            0x39 => Ok(Opcodes::CAST_U8),
+            0x3A => Ok(Opcodes::CAST_U64),
+            0x3B => Ok(Opcodes::CAST_U128),
             _ => Err(VMStatus::new(StatusCode::UNKNOWN_OPCODE)),
         }
     }

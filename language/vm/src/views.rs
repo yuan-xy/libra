@@ -523,6 +523,11 @@ impl<'a, T: ModuleAccess> SignatureTokenView<'a, T> {
     }
 
     #[inline]
+    pub fn signature_token(&self) -> &SignatureToken {
+        self.token
+    }
+
+    #[inline]
     pub fn signature_token_kind(&self) -> SignatureTokenKind {
         self.token.signature_token_kind()
     }
@@ -554,8 +559,9 @@ impl<'a, T: ModuleAccess> SignatureTokenView<'a, T> {
             SignatureToken::Reference(_)
             | SignatureToken::MutableReference(_)
             | SignatureToken::Bool
+            | SignatureToken::U8
             | SignatureToken::U64
-            | SignatureToken::String
+            | SignatureToken::U128
             | SignatureToken::ByteArray
             | SignatureToken::Address => false,
 

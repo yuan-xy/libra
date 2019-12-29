@@ -1,29 +1,27 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::block_info::{BlockInfo, Round};
-use crate::crypto_proxies::ValidatorSet;
-use crate::event::EVENT_KEY_LENGTH;
-use crate::transaction::{ChangeSet, Transaction};
 use crate::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_config::AccountResource,
     account_state_blob::AccountStateBlob,
+    block_info::{BlockInfo, Round},
     block_metadata::BlockMetadata,
     byte_array::ByteArray,
     contract_event::ContractEvent,
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeEventWithProof},
-    event::{EventHandle, EventKey},
+    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorSet},
+    discovery_info::DiscoveryInfo,
+    event::{EventHandle, EventKey, EVENT_KEY_LENGTH},
     get_with_proof::{ResponseItem, UpdateToLatestLedgerResponse},
     identifier::Identifier,
     language_storage::{StructTag, TypeTag},
     ledger_info::LedgerInfo,
     proof::{AccumulatorConsistencyProof, TransactionListProof},
     transaction::{
-        Module, RawTransaction, Script, SignatureCheckedTransaction, SignedTransaction,
-        TransactionArgument, TransactionListWithProof, TransactionPayload, TransactionStatus,
-        TransactionToCommit, Version,
+        ChangeSet, Module, RawTransaction, Script, SignatureCheckedTransaction, SignedTransaction,
+        Transaction, TransactionArgument, TransactionListWithProof, TransactionPayload,
+        TransactionStatus, TransactionToCommit, Version,
     },
     vm_error::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
@@ -32,16 +30,23 @@ use libra_crypto::{
     ed25519::{compat::keypair_strategy, *},
     hash::CryptoHash,
     traits::*,
+    x25519::X25519StaticPublicKey,
     HashValue,
 };
 use libra_proptest_helpers::Index;
+use parity_multiaddr::{Multiaddr, Protocol};
 use proptest::{
     collection::{vec, SizeRange},
     option,
     prelude::*,
 };
 use proptest_derive::Arbitrary;
-use std::time::Duration;
+use std::{
+    borrow::Cow,
+    iter::{FromIterator, Iterator},
+    net::{Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 prop_compose! {
     #[inline]
@@ -137,7 +142,7 @@ pub struct AccountInfoUniverse {
     accounts: Vec<AccountInfo>,
     epoch: u64,
     round: Round,
-    version: Version,
+    next_version: Version,
 }
 
 impl AccountInfoUniverse {
@@ -145,24 +150,18 @@ impl AccountInfoUniverse {
         keypairs: Vec<(Ed25519PrivateKey, Ed25519PublicKey)>,
         epoch: u64,
         round: Round,
-        version: Version,
+        next_version: Version,
     ) -> Self {
         let accounts = keypairs
             .into_iter()
             .map(|(private_key, public_key)| AccountInfo::new(private_key, public_key))
             .collect();
 
-        // Notice that the Genesis LedgerInfo has round=0, epoch=0, version=0,
-        // and if the first block after Genesis is empty, it has round=1, epoch=1 and version=0.
-        assert!(1 <= epoch);
-        assert!(epoch <= round);
-        assert!(round <= version + 1);
-
         Self {
             accounts,
             epoch,
             round,
-            version,
+            next_version,
         }
     }
 
@@ -181,8 +180,8 @@ impl AccountInfoUniverse {
     }
 
     fn bump_and_get_version(&mut self, block_size: usize) -> Version {
-        self.version += block_size as u64;
-        self.version
+        self.next_version += block_size as u64;
+        self.next_version - 1
     }
 
     fn get_epoch(&self) -> u64 {
@@ -200,7 +199,12 @@ impl Arbitrary for AccountInfoUniverse {
     type Parameters = usize;
     fn arbitrary_with(num_accounts: Self::Parameters) -> Self::Strategy {
         vec(keypair_strategy(), num_accounts)
-            .prop_map(|keypairs| AccountInfoUniverse::new(keypairs, 1, 1, 0))
+            .prop_map(|keypairs| {
+                AccountInfoUniverse::new(
+                    keypairs, /* epoch = */ 0, /* round = */ 0,
+                    /* next_version = */ 0,
+                )
+            })
             .boxed()
     }
 
@@ -529,7 +533,6 @@ impl Arbitrary for TransactionArgument {
             any::<u64>().prop_map(TransactionArgument::U64),
             any::<AccountAddress>().prop_map(TransactionArgument::Address),
             any::<ByteArray>().prop_map(TransactionArgument::ByteArray),
-            ".*".prop_map(TransactionArgument::String),
         ]
         .boxed()
     }
@@ -574,13 +577,13 @@ prop_compose! {
     fn arb_update_to_latest_ledger_response()(
         response_items in vec(any::<ResponseItem>(), 0..10),
         ledger_info_with_sigs in any::<LedgerInfoWithSignatures>(),
-        validator_change_events in any::<ValidatorChangeEventWithProof>(),
+        validator_change_proof in any::<ValidatorChangeProof>(),
         ledger_consistency_proof in any::<AccumulatorConsistencyProof>(),
     ) -> UpdateToLatestLedgerResponse {
         UpdateToLatestLedgerResponse::new(
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         )
     }
@@ -950,17 +953,21 @@ impl Arbitrary for BlockMetadata {
     type Strategy = BoxedStrategy<Self>;
 }
 
-#[derive(Arbitrary, Debug)]
+#[derive(Debug)]
 struct BlockInfoGen {
     id: HashValue,
     executed_state_id: HashValue,
     timestamp_usecs: u64,
-    new_epoch_if_not_empty: bool,
+    new_epoch: bool,
 }
 
 impl BlockInfoGen {
     pub fn materialize(self, universe: &mut AccountInfoUniverse, block_size: usize) -> BlockInfo {
-        let (epoch, next_validator_set) = if self.new_epoch_if_not_empty && block_size > 0 {
+        assert!(block_size > 0, "No empty blocks are allowed.");
+
+        let current_epoch = universe.get_epoch();
+        // The first LedgerInfo should always carry a validator set.
+        let (epoch, next_validator_set) = if current_epoch == 0 || self.new_epoch {
             (
                 universe.get_and_bump_epoch(),
                 Some(ValidatorSet::new(Vec::new())),
@@ -978,6 +985,28 @@ impl BlockInfoGen {
             self.timestamp_usecs,
             next_validator_set,
         )
+    }
+}
+
+impl Arbitrary for BlockInfoGen {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        // A small percent of them generate epoch changes.
+        (
+            any::<HashValue>(),
+            any::<HashValue>(),
+            any::<u64>(),
+            prop_oneof![1 => Just(true), 3 => Just(false)],
+        )
+            .prop_map(|(id, executed_state_id, timestamp_usecs, new_epoch)| Self {
+                id,
+                executed_state_id,
+                timestamp_usecs,
+                new_epoch,
+            })
+            .boxed()
     }
 }
 
@@ -1036,5 +1065,54 @@ impl LedgerInfoWithSignaturesGen {
             .collect();
 
         LedgerInfoWithSignatures::new(ledger_info, signatures)
+    }
+}
+
+pub fn arb_multiaddr_protocol() -> impl Strategy<Value = Protocol<'static>> {
+    prop_oneof![
+        any::<u16>().prop_map(Protocol::Tcp),
+        any::<u16>().prop_map(Protocol::Udp),
+        any::<u16>().prop_map(|port| Protocol::Memory(port as u64)),
+        any::<u32>().prop_map(|addr| Protocol::Ip4(Ipv4Addr::from(addr))),
+        any::<u128>().prop_map(|addr| Protocol::Ip6(Ipv6Addr::from(addr))),
+        any::<String>().prop_map(|domain| Protocol::Dns4(Cow::Owned(domain))),
+        any::<String>().prop_map(|domain| Protocol::Dns6(Cow::Owned(domain))),
+    ]
+}
+
+pub fn arb_multiaddr() -> impl Strategy<Value = Multiaddr> {
+    vec(arb_multiaddr_protocol(), 0..10).prop_map(Multiaddr::from_iter)
+}
+
+impl Arbitrary for DiscoveryInfo {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        (
+            any::<AccountAddress>(),
+            any::<X25519StaticPublicKey>(),
+            arb_multiaddr(),
+            any::<X25519StaticPublicKey>(),
+            arb_multiaddr(),
+        )
+            .prop_map(
+                |(
+                    account_address,
+                    validator_network_identity_pubkey,
+                    validator_network_address,
+                    fullnodes_network_identity_pubkey,
+                    fullnodes_network_address,
+                )| {
+                    DiscoveryInfo::new(
+                        account_address,
+                        validator_network_identity_pubkey,
+                        validator_network_address,
+                        fullnodes_network_identity_pubkey,
+                        fullnodes_network_address,
+                    )
+                },
+            )
+            .boxed()
     }
 }

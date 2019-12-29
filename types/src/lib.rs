@@ -12,6 +12,7 @@ pub mod block_metadata;
 pub mod byte_array;
 pub mod contract_event;
 pub mod crypto_proxies;
+pub mod discovery_info;
 pub mod discovery_set;
 pub mod event;
 pub mod get_with_proof;
@@ -31,6 +32,7 @@ pub mod validator_set;
 pub mod validator_signer;
 pub mod validator_verifier;
 pub mod vm_error;
+pub mod waypoint;
 pub mod write_set;
 
 pub use account_address::AccountAddress as PeerId;

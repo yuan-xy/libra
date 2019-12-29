@@ -83,9 +83,10 @@ impl<'a> StackUsageVerifier<'a> {
             | Bytecode::StLoc(_) => (1, 0),
 
             // Instructions that push, but don't pop
-            Bytecode::LdConst(_)
+            Bytecode::LdU8(_)
+            | Bytecode::LdU64(_)
+            | Bytecode::LdU128(_)
             | Bytecode::LdAddr(_)
-            | Bytecode::LdStr(_)
             | Bytecode::LdTrue
             | Bytecode::LdFalse
             | Bytecode::LdByteArray(_)
@@ -109,7 +110,10 @@ impl<'a> StackUsageVerifier<'a> {
             | Bytecode::ImmBorrowGlobal(_, _)
             | Bytecode::MutBorrowField(_)
             | Bytecode::ImmBorrowField(_)
-            | Bytecode::MoveFrom(_, _) => (1, 1),
+            | Bytecode::MoveFrom(_, _)
+            | Bytecode::CastU8
+            | Bytecode::CastU64
+            | Bytecode::CastU128 => (1, 1),
 
             // Binary operations (pop twice and push once)
             Bytecode::Add
@@ -120,6 +124,8 @@ impl<'a> StackUsageVerifier<'a> {
             | Bytecode::BitOr
             | Bytecode::BitAnd
             | Bytecode::Xor
+            | Bytecode::Shl
+            | Bytecode::Shr
             | Bytecode::Or
             | Bytecode::And
             | Bytecode::Eq

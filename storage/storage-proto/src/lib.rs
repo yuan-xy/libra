@@ -27,21 +27,129 @@
 
 pub mod proto;
 
-use anyhow::{format_err, Error, Result};
+use anyhow::{ensure, format_err, Error, Result};
 use libra_crypto::HashValue;
 use libra_types::{
     account_address::AccountAddress,
     account_state_blob::AccountStateBlob,
-    crypto_proxies::LedgerInfoWithSignatures,
-    proof::SparseMerkleProof,
+    crypto_proxies::{LedgerInfoWithSignatures, ValidatorSet},
+    proof::{SparseMerkleProof, SparseMerkleRangeProof},
     transaction::{TransactionListWithProof, TransactionToCommit, Version},
 };
+#[cfg(any(test, feature = "fuzzing"))]
+use proptest::prelude::*;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use std::convert::{TryFrom, TryInto};
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+pub struct GetLatestStateRootResponse {
+    pub version: Version,
+    pub state_root_hash: HashValue,
+}
+
+impl GetLatestStateRootResponse {
+    pub fn new(version: Version, state_root_hash: HashValue) -> Self {
+        Self {
+            version,
+            state_root_hash,
+        }
+    }
+}
+
+impl TryFrom<crate::proto::storage::GetLatestStateRootResponse> for GetLatestStateRootResponse {
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::storage::GetLatestStateRootResponse) -> Result<Self> {
+        let version = proto.version;
+        let state_root_hash = HashValue::from_slice(&proto.state_root_hash)?;
+
+        Ok(Self::new(version, state_root_hash))
+    }
+}
+
+impl From<GetLatestStateRootResponse> for crate::proto::storage::GetLatestStateRootResponse {
+    fn from(response: GetLatestStateRootResponse) -> Self {
+        Self {
+            version: response.version,
+            state_root_hash: response.state_root_hash.to_vec(),
+        }
+    }
+}
+
+impl Into<(Version, HashValue)> for GetLatestStateRootResponse {
+    fn into(self) -> (Version, HashValue) {
+        (self.version, self.state_root_hash)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+pub struct GetLatestAccountStateRequest {
+    pub address: AccountAddress,
+}
+
+impl GetLatestAccountStateRequest {
+    pub fn new(address: AccountAddress) -> Self {
+        Self { address }
+    }
+}
+
+impl TryFrom<crate::proto::storage::GetLatestAccountStateRequest> for GetLatestAccountStateRequest {
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::storage::GetLatestAccountStateRequest) -> Result<Self> {
+        let address = AccountAddress::try_from(&proto.address[..])?;
+        Ok(Self::new(address))
+    }
+}
+
+impl From<GetLatestAccountStateRequest> for crate::proto::storage::GetLatestAccountStateRequest {
+    fn from(request: GetLatestAccountStateRequest) -> Self {
+        Self {
+            address: request.address.into(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+pub struct GetLatestAccountStateResponse {
+    pub account_state_blob: Option<AccountStateBlob>,
+}
+
+impl GetLatestAccountStateResponse {
+    pub fn new(account_state_blob: Option<AccountStateBlob>) -> Self {
+        Self { account_state_blob }
+    }
+}
+
+impl TryFrom<crate::proto::storage::GetLatestAccountStateResponse>
+    for GetLatestAccountStateResponse
+{
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::storage::GetLatestAccountStateResponse) -> Result<Self> {
+        let account_state_blob = proto
+            .account_state_blob
+            .map(TryFrom::try_from)
+            .transpose()?;
+        Ok(Self::new(account_state_blob))
+    }
+}
+
+impl From<GetLatestAccountStateResponse> for crate::proto::storage::GetLatestAccountStateResponse {
+    fn from(response: GetLatestAccountStateResponse) -> Self {
+        Self {
+            account_state_blob: response.account_state_blob.map(Into::into),
+        }
+    }
+}
+
 /// Helper to construct and parse [`proto::storage::GetAccountStateWithProofByVersionRequest`]
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct GetAccountStateWithProofByVersionRequest {
     /// The access path to query with.
     pub address: AccountAddress,
@@ -75,16 +183,17 @@ impl TryFrom<crate::proto::storage::GetAccountStateWithProofByVersionRequest>
 impl From<GetAccountStateWithProofByVersionRequest>
     for crate::proto::storage::GetAccountStateWithProofByVersionRequest
 {
-    fn from(version: GetAccountStateWithProofByVersionRequest) -> Self {
+    fn from(request: GetAccountStateWithProofByVersionRequest) -> Self {
         Self {
-            address: version.address.into(),
-            version: version.version,
+            address: request.address.into(),
+            version: request.version,
         }
     }
 }
 
 /// Helper to construct and parse [`proto::storage::GetAccountStateWithProofByVersionResponse`]
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct GetAccountStateWithProofByVersionResponse {
     /// The account state blob requested.
     pub account_state_blob: Option<AccountStateBlob>,
@@ -143,6 +252,89 @@ impl Into<(Option<AccountStateBlob>, SparseMerkleProof)>
 {
     fn into(self) -> (Option<AccountStateBlob>, SparseMerkleProof) {
         (self.account_state_blob, self.sparse_merkle_proof)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+pub struct GetAccountStateRangeProofRequest {
+    pub rightmost_key: HashValue,
+    pub version: Version,
+}
+
+impl GetAccountStateRangeProofRequest {
+    pub fn new(rightmost_key: HashValue, version: Version) -> Self {
+        Self {
+            rightmost_key,
+            version,
+        }
+    }
+}
+
+impl TryFrom<crate::proto::storage::GetAccountStateRangeProofRequest>
+    for GetAccountStateRangeProofRequest
+{
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::storage::GetAccountStateRangeProofRequest) -> Result<Self> {
+        let rightmost_key = HashValue::from_slice(&proto.rightmost_key)?;
+        let version = proto.version;
+        Ok(Self::new(rightmost_key, version))
+    }
+}
+
+impl From<GetAccountStateRangeProofRequest>
+    for crate::proto::storage::GetAccountStateRangeProofRequest
+{
+    fn from(request: GetAccountStateRangeProofRequest) -> Self {
+        let rightmost_key = request.rightmost_key.to_vec();
+        let version = request.version;
+
+        Self {
+            rightmost_key,
+            version,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+pub struct GetAccountStateRangeProofResponse {
+    proof: SparseMerkleRangeProof,
+}
+
+impl GetAccountStateRangeProofResponse {
+    pub fn new(proof: SparseMerkleRangeProof) -> Self {
+        Self { proof }
+    }
+}
+
+impl TryFrom<crate::proto::storage::GetAccountStateRangeProofResponse>
+    for GetAccountStateRangeProofResponse
+{
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::storage::GetAccountStateRangeProofResponse) -> Result<Self> {
+        let proof = proto
+            .proof
+            .ok_or_else(|| format_err!("Missing proof."))?
+            .try_into()?;
+        Ok(Self::new(proof))
+    }
+}
+
+impl From<GetAccountStateRangeProofResponse>
+    for crate::proto::storage::GetAccountStateRangeProofResponse
+{
+    fn from(response: GetAccountStateRangeProofResponse) -> Self {
+        let proof = Some(response.proof.into());
+        Self { proof }
+    }
+}
+
+impl Into<SparseMerkleRangeProof> for GetAccountStateRangeProofResponse {
+    fn into(self) -> SparseMerkleRangeProof {
+        self.proof
     }
 }
 
@@ -358,38 +550,120 @@ impl From<TreeState> for crate::proto::storage::TreeState {
 
 /// Helper to construct and parse [`proto::storage::StartupInfo`]
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct StartupInfo {
-    pub ledger_info: LedgerInfoWithSignatures,
-    pub ledger_info_with_validators: LedgerInfoWithSignatures,
+    /// The latest ledger info.
+    pub latest_ledger_info: LedgerInfoWithSignatures,
+    /// If the above ledger info doesn't carry a validator set, the latest validator set. Otherwise
+    /// `None`.
+    pub latest_validator_set: Option<ValidatorSet>,
     pub committed_tree_state: TreeState,
     pub synced_tree_state: Option<TreeState>,
+}
+
+impl StartupInfo {
+    pub fn new(
+        latest_ledger_info: LedgerInfoWithSignatures,
+        latest_validator_set: Option<ValidatorSet>,
+        committed_tree_state: TreeState,
+        synced_tree_state: Option<TreeState>,
+    ) -> Self {
+        Self {
+            latest_ledger_info,
+            latest_validator_set,
+            committed_tree_state,
+            synced_tree_state,
+        }
+    }
+
+    pub fn get_validator_set(&self) -> &ValidatorSet {
+        match self.latest_ledger_info.ledger_info().next_validator_set() {
+            Some(x) => x,
+            None => self
+                .latest_validator_set
+                .as_ref()
+                .expect("Validator set must exist."),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+fn arb_startup_info() -> impl Strategy<Value = StartupInfo> {
+    any::<LedgerInfoWithSignatures>()
+        .prop_flat_map(|latest_ledger_info| {
+            let latest_validator_set_strategy = if latest_ledger_info
+                .ledger_info()
+                .next_validator_set()
+                .is_some()
+            {
+                Just(None).boxed()
+            } else {
+                any::<ValidatorSet>().prop_map(Some).boxed()
+            };
+
+            (
+                Just(latest_ledger_info),
+                latest_validator_set_strategy,
+                any::<TreeState>(),
+                any::<Option<TreeState>>(),
+            )
+        })
+        .prop_map(
+            |(
+                latest_ledger_info,
+                latest_validator_set,
+                committed_tree_state,
+                synced_tree_state,
+            )| {
+                StartupInfo::new(
+                    latest_ledger_info,
+                    latest_validator_set,
+                    committed_tree_state,
+                    synced_tree_state,
+                )
+            },
+        )
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+impl Arbitrary for StartupInfo {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        arb_startup_info().boxed()
+    }
 }
 
 impl TryFrom<crate::proto::storage::StartupInfo> for StartupInfo {
     type Error = Error;
 
     fn try_from(proto: crate::proto::storage::StartupInfo) -> Result<Self> {
-        let ledger_info = proto
-            .ledger_info
-            .ok_or_else(|| format_err!("Missing ledger_info"))?
+        let latest_ledger_info: LedgerInfoWithSignatures = proto
+            .latest_ledger_info
+            .ok_or_else(|| format_err!("Missing latest_ledger_info"))?
             .try_into()?;
-        let ledger_info_with_validators = proto
-            .ledger_info_with_validators
-            .ok_or_else(|| format_err!("Missing ledger_info"))?
-            .try_into()?;
+        let latest_validator_set = proto
+            .latest_validator_set
+            .map(TryInto::try_into)
+            .transpose()?;
         let committed_tree_state = proto
             .committed_tree_state
             .ok_or_else(|| format_err!("Missing committed_tree_state"))?
             .try_into()?;
-        let synced_tree_state = proto
-            .synced_tree_state
-            .map(TreeState::try_from)
-            .transpose()?;
+        let synced_tree_state = proto.synced_tree_state.map(TryInto::try_into).transpose()?;
+
+        ensure!(
+            latest_ledger_info
+                .ledger_info()
+                .next_validator_set()
+                .is_some()
+                != latest_validator_set.is_some(),
+            "Only one validator set should exist.",
+        );
 
         Ok(Self {
-            ledger_info,
-            ledger_info_with_validators,
+            latest_ledger_info,
+            latest_validator_set,
             committed_tree_state,
             synced_tree_state,
         })
@@ -398,14 +672,14 @@ impl TryFrom<crate::proto::storage::StartupInfo> for StartupInfo {
 
 impl From<StartupInfo> for crate::proto::storage::StartupInfo {
     fn from(info: StartupInfo) -> Self {
-        let ledger_info = Some(info.ledger_info.into());
-        let ledger_info_with_validators = Some(info.ledger_info_with_validators.into());
+        let latest_ledger_info = Some(info.latest_ledger_info.into());
+        let latest_validator_set = info.latest_validator_set.map(Into::into);
         let committed_tree_state = Some(info.committed_tree_state.into());
         let synced_tree_state = info.synced_tree_state.map(Into::into);
 
         Self {
-            ledger_info,
-            ledger_info_with_validators,
+            latest_ledger_info,
+            latest_validator_set,
             committed_tree_state,
             synced_tree_state,
         }
@@ -442,12 +716,16 @@ impl From<GetStartupInfoResponse> for crate::proto::storage::GetStartupInfoRespo
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct GetEpochChangeLedgerInfosRequest {
     pub start_epoch: u64,
+    pub end_epoch: u64,
 }
 
 impl GetEpochChangeLedgerInfosRequest {
     /// Constructor.
-    pub fn new(start_epoch: u64) -> Self {
-        Self { start_epoch }
+    pub fn new(start_epoch: u64, end_epoch: u64) -> Self {
+        Self {
+            start_epoch,
+            end_epoch,
+        }
     }
 }
 
@@ -459,6 +737,7 @@ impl TryFrom<crate::proto::storage::GetEpochChangeLedgerInfosRequest>
     fn try_from(proto: crate::proto::storage::GetEpochChangeLedgerInfosRequest) -> Result<Self> {
         Ok(Self {
             start_epoch: proto.start_epoch,
+            end_epoch: proto.end_epoch,
         })
     }
 }
@@ -469,64 +748,14 @@ impl From<GetEpochChangeLedgerInfosRequest>
     fn from(request: GetEpochChangeLedgerInfosRequest) -> Self {
         Self {
             start_epoch: request.start_epoch,
+            end_epoch: request.end_epoch,
         }
-    }
-}
-
-/// Helper to construct and parse [`proto::storage::GetEpochChangeLedgerInfosResponse`]
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-pub struct GetEpochChangeLedgerInfosResponse {
-    pub ledger_infos_with_sigs: Vec<LedgerInfoWithSignatures>,
-}
-
-impl GetEpochChangeLedgerInfosResponse {
-    /// Constructor.
-    pub fn new(latest_ledger_infos: Vec<LedgerInfoWithSignatures>) -> Self {
-        Self {
-            ledger_infos_with_sigs: latest_ledger_infos,
-        }
-    }
-}
-
-impl TryFrom<crate::proto::storage::GetEpochChangeLedgerInfosResponse>
-    for GetEpochChangeLedgerInfosResponse
-{
-    type Error = Error;
-
-    fn try_from(proto: crate::proto::storage::GetEpochChangeLedgerInfosResponse) -> Result<Self> {
-        Ok(Self {
-            ledger_infos_with_sigs: proto
-                .latest_ledger_infos
-                .into_iter()
-                .map(TryFrom::try_from)
-                .collect::<Result<Vec<_>>>()?,
-        })
-    }
-}
-
-impl From<GetEpochChangeLedgerInfosResponse>
-    for crate::proto::storage::GetEpochChangeLedgerInfosResponse
-{
-    fn from(response: GetEpochChangeLedgerInfosResponse) -> Self {
-        Self {
-            latest_ledger_infos: response
-                .ledger_infos_with_sigs
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-        }
-    }
-}
-
-impl Into<Vec<LedgerInfoWithSignatures>> for GetEpochChangeLedgerInfosResponse {
-    fn into(self) -> Vec<LedgerInfoWithSignatures> {
-        self.ledger_infos_with_sigs
     }
 }
 
 /// Helper to construct and parse [`proto::storage::BackupAccountStateRequest`]
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct BackupAccountStateRequest {
     /// The version of state to backup.
     pub version: Version,
@@ -558,7 +787,8 @@ impl From<BackupAccountStateRequest> for crate::proto::storage::BackupAccountSta
 }
 
 /// Helper to construct and parse [`proto::storage::BackupAccountStateResponse`]
-#[derive(PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct BackupAccountStateResponse {
     /// The hashed account address
     pub account_key: HashValue,

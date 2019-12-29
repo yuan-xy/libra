@@ -5,37 +5,47 @@ use anyhow::Result;
 use consensus_types::block::Block;
 use consensus_types::executed_block::ExecutedBlock;
 use executor::{ExecutedTrees, ProcessedVMOutput, StateComputeResult};
-use futures::Future;
-use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeEventWithProof};
-use std::{pin::Pin, sync::Arc};
+use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof};
+use std::sync::Arc;
 
 /// Retrieves and updates the status of transactions on demand (e.g., via talking with Mempool)
+#[async_trait::async_trait]
 pub trait TxnManager: Send + Sync {
     type Payload;
 
     /// Brings new transactions to be applied.
     /// The `exclude_txns` list includes the transactions that are already pending in the
     /// branch of blocks consensus is trying to extend.
-    fn pull_txns(
-        &self,
+    async fn pull_txns(
+        &mut self,
         max_size: u64,
         exclude_txns: Vec<&Self::Payload>,
-    ) -> Pin<Box<dyn Future<Output = Result<Self::Payload>> + Send>>;
+    ) -> Result<Self::Payload>;
 
     /// Notifies TxnManager about the payload of the committed block including the state compute
     /// result, which includes the specifics of what transactions succeeded and failed.
-    fn commit_txns<'a>(
-        &'a self,
+    async fn commit_txns(
+        &mut self,
         txns: &Self::Payload,
         compute_result: &StateComputeResult,
         // Monotonic timestamp_usecs of committed blocks is used to GC expired transactions.
         timestamp_usecs: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
+    ) -> Result<()>;
+
+    /// Bypass the trait object non-clonable limit.
+    fn _clone_box(&self) -> Box<dyn TxnManager<Payload = Self::Payload>>;
+}
+
+impl<T> Clone for Box<dyn TxnManager<Payload = T>> {
+    fn clone(&self) -> Box<dyn TxnManager<Payload = T>> {
+        self._clone_box()
+    }
 }
 
 /// While Consensus is managing proposed blocks, `StateComputer` is managing the results of the
 /// (speculative) execution of their payload.
 /// StateComputer is using proposed block ids for identifying the transactions.
+#[async_trait::async_trait]
 pub trait StateComputer: Send + Sync {
     type Payload;
 
@@ -53,37 +63,25 @@ pub trait StateComputer: Send + Sync {
     ) -> Result<ProcessedVMOutput>;
 
     /// Send a successful commit. A future is fulfilled when the state is finalized.
-    fn commit(
+    async fn commit(
         &self,
         blocks: Vec<&ExecutedBlock<Self::Payload>>,
         finality_proof: LedgerInfoWithSignatures,
         synced_trees: &ExecutedTrees,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+    ) -> Result<()>;
 
     /// Best effort state synchronization to the given target LedgerInfo.
     /// In case of success (`Result::Ok`) the LI of storage is at the given target.
     /// In case of failure (`Result::Error`) the LI of storage remains unchanged, and the validator
     /// can assume there were no modifications to the storage made.
-    fn sync_to(
-        &self,
-        target: LedgerInfoWithSignatures,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
-
-    fn sync_to_or_bail(&self, commit: LedgerInfoWithSignatures) {
-        let status = futures::executor::block_on(self.sync_to(commit));
-        // TODO: this is going to change after https://github.com/libra/libra/issues/1590
-        status.expect(
-            "state synchronizer failure, this validator will be killed as it can not \
-             recover from this error.  After the validator is restarted, synchronization will \
-             be retried. failure:",
-        )
-    }
+    async fn sync_to(&self, target: LedgerInfoWithSignatures) -> Result<()>;
 
     /// Generate the epoch change proof from start_epoch to the latest epoch.
-    fn get_epoch_proof(
+    async fn get_epoch_proof(
         &self,
         start_epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<ValidatorChangeEventWithProof>> + Send>>;
+        end_epoch: u64,
+    ) -> Result<ValidatorChangeProof>;
 }
 
 pub trait StateMachineReplication {
@@ -92,7 +90,7 @@ pub trait StateMachineReplication {
     /// persisted storage and all the threads have been started.
     fn start(
         &mut self,
-        txn_manager: Arc<dyn TxnManager<Payload = Self::Payload>>,
+        txn_manager: Box<dyn TxnManager<Payload = Self::Payload>>,
         state_computer: Arc<dyn StateComputer<Payload = Self::Payload>>,
     ) -> Result<()>;
 

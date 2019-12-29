@@ -4,17 +4,15 @@
 //! This module provides mock storage clients for tests.
 
 use anyhow::{Error, Result};
-use futures::prelude::*;
 use futures::stream::BoxStream;
 use libra_crypto::{ed25519::*, HashValue};
 use libra_types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
     account_state_blob::AccountStateBlob,
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeEventWithProof},
+    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
     event::EventHandle,
     get_with_proof::{RequestItem, ResponseItem},
-    proof::AccumulatorConsistencyProof,
-    proof::SparseMerkleProof,
+    proof::{AccumulatorConsistencyProof, SparseMerkleProof, SparseMerkleRangeProof},
     proto::types::{
         request_item::RequestedItems, response_item::ResponseItems, AccountStateWithProof,
         GetAccountStateResponse, GetTransactionsResponse,
@@ -30,7 +28,7 @@ use rand::{
     rngs::{OsRng, StdRng},
     Rng, SeedableRng,
 };
-use std::{collections::BTreeMap, convert::TryFrom, pin::Pin};
+use std::{collections::BTreeMap, convert::TryFrom};
 use storage_client::StorageRead;
 use storage_proto::{BackupAccountStateResponse, StartupInfo};
 
@@ -41,23 +39,18 @@ use storage_proto::{BackupAccountStateResponse, StartupInfo};
 #[derive(Clone)]
 pub struct MockStorageReadClient;
 
+#[async_trait::async_trait]
 impl StorageRead for MockStorageReadClient {
-    fn update_to_latest_ledger_async(
+    async fn update_to_latest_ledger_async(
         &self,
         client_known_version: Version,
         request_items: Vec<RequestItem>,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<(
-                        Vec<ResponseItem>,
-                        LedgerInfoWithSignatures,
-                        ValidatorChangeEventWithProof,
-                        AccumulatorConsistencyProof,
-                    )>,
-                > + Send,
-        >,
-    > {
+    ) -> Result<(
+        Vec<ResponseItem>,
+        LedgerInfoWithSignatures,
+        ValidatorChangeProof,
+        AccumulatorConsistencyProof,
+    )> {
         let request = libra_types::get_with_proof::UpdateToLatestLedgerRequest::new(
             client_known_version,
             request_items,
@@ -70,50 +63,65 @@ impl StorageRead for MockStorageReadClient {
         let ret = (
             response.response_items,
             response.ledger_info_with_sigs,
-            response.validator_change_events,
+            response.validator_change_proof,
             response.ledger_consistency_proof,
         );
-        futures::future::ok(ret).boxed()
+        Ok(ret)
     }
 
-    fn get_transactions_async(
+    async fn get_transactions_async(
         &self,
         _start_version: Version,
         _batch_size: u64,
         _ledger_version: Version,
         _fetch_events: bool,
-    ) -> Pin<
-        Box<dyn Future<Output = Result<libra_types::transaction::TransactionListWithProof>> + Send>,
-    > {
+    ) -> Result<libra_types::transaction::TransactionListWithProof> {
         unimplemented!()
     }
 
-    fn get_account_state_with_proof_by_version_async(
+    async fn get_latest_state_root_async(&self) -> Result<(Version, HashValue)> {
+        unimplemented!()
+    }
+
+    async fn get_latest_account_state_async(
+        &self,
+        _address: AccountAddress,
+    ) -> Result<Option<AccountStateBlob>> {
+        Ok(Some(get_mock_account_state_blob()))
+    }
+
+    async fn get_account_state_with_proof_by_version_async(
         &self,
         _address: AccountAddress,
         _version: Version,
-    ) -> Pin<Box<dyn Future<Output = Result<(Option<AccountStateBlob>, SparseMerkleProof)>> + Send>>
-    {
+    ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)> {
         unimplemented!();
     }
 
-    fn get_startup_info_async(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<StartupInfo>>> + Send>> {
+    async fn get_startup_info_async(&self) -> Result<Option<StartupInfo>> {
         unimplemented!()
     }
 
-    fn get_epoch_change_ledger_infos_async(
+    async fn get_epoch_change_ledger_infos_async(
         &self,
         _start_epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<LedgerInfoWithSignatures>>> + Send>> {
+        _end_epoch: u64,
+    ) -> Result<ValidatorChangeProof> {
         unimplemented!()
     }
 
-    fn backup_account_state_async(
+    fn backup_account_state(
         &self,
         _version: u64,
-    ) -> Result<BoxStream<Result<BackupAccountStateResponse, Error>>> {
+    ) -> Result<BoxStream<'_, Result<BackupAccountStateResponse, Error>>> {
+        unimplemented!()
+    }
+
+    async fn get_account_state_range_proof(
+        &self,
+        _rightmost_key: HashValue,
+        _version: Version,
+    ) -> Result<SparseMerkleRangeProof> {
         unimplemented!()
     }
 }
@@ -143,24 +151,9 @@ fn get_mock_response_item(request_item: &ProtoRequestItem) -> Result<ProtoRespon
         match requested_item {
             RequestedItems::GetAccountStateRequest(_request) => {
                 let mut resp = GetAccountStateResponse::default();
-                let mut version_data = BTreeMap::new();
 
-                let account_resource = libra_types::account_config::AccountResource::new(
-                    100,
-                    0,
-                    libra_types::byte_array::ByteArray::new(vec![]),
-                    false,
-                    false,
-                    EventHandle::random_handle(0),
-                    EventHandle::random_handle(0),
-                    0,
-                );
-                version_data.insert(
-                    libra_types::account_config::account_resource_path(),
-                    lcs::to_bytes(&account_resource)?,
-                );
                 let mut account_state_with_proof = AccountStateWithProof::default();
-                let blob = AccountStateBlob::from(lcs::to_bytes(&version_data)?).into();
+                let blob = get_mock_account_state_blob().into();
                 let proof = {
                     let ledger_info_to_transaction_info_proof =
                         libra_types::proof::AccumulatorProof::new(vec![]);
@@ -207,6 +200,27 @@ fn get_mock_response_item(request_item: &ProtoRequestItem) -> Result<ProtoRespon
         }
     }
     Ok(response_item)
+}
+
+fn get_mock_account_state_blob() -> AccountStateBlob {
+    let account_resource = libra_types::account_config::AccountResource::new(
+        100,
+        0,
+        libra_types::byte_array::ByteArray::new(vec![]),
+        false,
+        false,
+        EventHandle::random_handle(0),
+        EventHandle::random_handle(0),
+        0,
+    );
+
+    let mut version_data = BTreeMap::new();
+    version_data.insert(
+        libra_types::account_config::account_resource_path(),
+        lcs::to_bytes(&account_resource).unwrap(),
+    );
+
+    AccountStateBlob::from(lcs::to_bytes(&version_data).unwrap())
 }
 
 fn get_mock_txn_data(

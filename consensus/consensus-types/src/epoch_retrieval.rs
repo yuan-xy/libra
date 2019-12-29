@@ -4,11 +4,11 @@
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
-/// Request to get a ValidatorChangeEventWithProof from current_epoch to target_epoch
+/// Request to get a ValidatorChangeProof from current_epoch to target_epoch
 #[derive(Serialize, Deserialize)]
 pub struct EpochRetrievalRequest {
     pub start_epoch: u64,
-    pub target_epoch: u64,
+    pub end_epoch: u64,
 }
 
 impl TryFrom<network::proto::RequestEpoch> for EpochRetrievalRequest {

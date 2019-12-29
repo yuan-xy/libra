@@ -28,6 +28,11 @@ pub struct PerformanceBenchmarkNodesDownParams {
         help = "Number of nodes which should be down"
     )]
     pub num_nodes_down: usize,
+    #[structopt(
+        long,
+        help = "Whether cluster test should run against validators or full nodes"
+    )]
+    pub is_fullnode: bool,
 }
 
 pub struct PerformanceBenchmarkNodesDown {
@@ -39,11 +44,22 @@ pub struct PerformanceBenchmarkNodesDown {
 impl ExperimentParam for PerformanceBenchmarkNodesDownParams {
     type E = PerformanceBenchmarkNodesDown;
     fn build(self, cluster: &Cluster) -> Self::E {
-        let (down_instances, up_instances) = cluster.split_n_random(self.num_nodes_down);
-        Self::E {
-            down_instances: down_instances.into_instances(),
-            up_instances: up_instances.into_instances(),
-            num_nodes_down: self.num_nodes_down,
+        if self.is_fullnode {
+            let (down_instances, up_instances) =
+                cluster.split_n_fullnodes_random(self.num_nodes_down);
+            Self::E {
+                down_instances: down_instances.into_fullnode_instances(),
+                up_instances: up_instances.into_fullnode_instances(),
+                num_nodes_down: self.num_nodes_down,
+            }
+        } else {
+            let (down_instances, up_instances) =
+                cluster.split_n_validators_random(self.num_nodes_down);
+            Self::E {
+                down_instances: down_instances.into_validator_instances(),
+                up_instances: up_instances.into_validator_instances(),
+                num_nodes_down: self.num_nodes_down,
+            }
         }
     }
 }
@@ -69,7 +85,8 @@ impl Experiment for PerformanceBenchmarkNodesDown {
             let window = Duration::from_secs(180);
             context
                 .tx_emitter
-                .emit_txn_for(window + Duration::from_secs(60), self.up_instances.clone())?;
+                .emit_txn_for(window + Duration::from_secs(60), self.up_instances.clone())
+                .await?;
             let end = unix_timestamp_now();
             let start = end - window;
             let (avg_tps, avg_latency) = stats::txn_stats(&context.prometheus, start, end)?;

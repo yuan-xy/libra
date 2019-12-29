@@ -123,17 +123,18 @@ pub fn main() {
     }
 
     if args.emit_tx {
+        let mut rt = Runtime::new().unwrap();
         let thread_params = EmitThreadParams {
             wait_millis: args.wait_millis,
             wait_committed: !args.burst,
         };
         if args.swarm {
             let util = BasicSwarmUtil::setup(&args);
-            util.emit_tx(args.accounts_per_client, thread_params);
+            rt.block_on(util.emit_tx(args.accounts_per_client, thread_params));
             return;
         } else {
             let util = ClusterUtil::setup(&args);
-            util.emit_tx(args.accounts_per_client, thread_params);
+            rt.block_on(util.emit_tx(args.accounts_per_client, thread_params));
             return;
         }
     } else if args.discovery {
@@ -185,13 +186,21 @@ pub fn main() {
     } else if args.run_ci_suite {
         perf_msg = Some(exit_on_error(runner.run_ci_suite()));
     } else if let Some(experiment_name) = args.run {
-        runner
+        if let Some(result) = runner
             .cleanup_and_run(get_experiment(
                 &experiment_name,
                 &args.last,
                 &runner.cluster,
             ))
-            .unwrap();
+            .unwrap()
+        {
+            info!(
+                "{}Experiment Result: {}{}",
+                style::Bold,
+                result,
+                style::Reset
+            );
+        };
     } else if args.changelog.is_none() && args.deploy.is_none() {
         println!("No action specified");
         process::exit(1);
@@ -286,14 +295,15 @@ impl BasicSwarmUtil {
         }
     }
 
-    pub fn emit_tx(self, accounts_per_client: usize, thread_params: EmitThreadParams) {
+    pub async fn emit_tx(self, accounts_per_client: usize, thread_params: EmitThreadParams) {
         let mut emitter = TxEmitter::new(&self.cluster);
         emitter
             .start_job(EmitJobRequest {
-                instances: self.cluster.instances().to_vec(),
+                instances: self.cluster.validator_instances().to_vec(),
                 accounts_per_client,
                 thread_params,
             })
+            .await
             .expect("Failed to start emit job");
         thread::park();
     }
@@ -306,7 +316,7 @@ impl ClusterUtil {
         let cluster = if args.peers.is_empty() {
             cluster
         } else {
-            cluster.sub_cluster(args.peers.clone())
+            cluster.validator_sub_cluster(args.peers.clone())
         };
         let prometheus = Prometheus::new(
             cluster
@@ -315,7 +325,7 @@ impl ClusterUtil {
         );
         info!(
             "Discovered {} peers in {} workspace",
-            cluster.instances().len(),
+            cluster.validator_instances().len(),
             aws.workspace()
         );
         Self {
@@ -326,14 +336,14 @@ impl ClusterUtil {
     }
 
     pub fn discovery(&self) {
-        for instance in self.cluster.instances() {
+        for instance in self.cluster.validator_instances() {
             println!("{} {}", instance.peer_name(), instance.ip());
         }
     }
 
     pub fn pssh(&self, cmd: Vec<String>) {
         let mut runtime = Runtime::new().unwrap();
-        let futures = self.cluster.instances().iter().map(|x| {
+        let futures = self.cluster.validator_instances().iter().map(|x| {
             x.run_cmd_tee_err(&cmd).map(move |r| {
                 if let Err(e) = r {
                     warn!("Failed on {}: {}", x, e)
@@ -343,14 +353,15 @@ impl ClusterUtil {
         runtime.block_on(join_all(futures));
     }
 
-    pub fn emit_tx(self, accounts_per_client: usize, thread_params: EmitThreadParams) {
+    pub async fn emit_tx(self, accounts_per_client: usize, thread_params: EmitThreadParams) {
         let mut emitter = TxEmitter::new(&self.cluster);
         emitter
             .start_job(EmitJobRequest {
-                instances: self.cluster.instances().to_vec(),
+                instances: self.cluster.validator_instances().to_vec(),
                 accounts_per_client,
                 thread_params,
             })
+            .await
             .expect("Failed to start emit job");
         self.run_stat_loop();
     }
@@ -631,7 +642,7 @@ impl ClusterTestRunner {
     }
 
     pub fn stop_experiment(&mut self, max_stopped: usize) {
-        let mut instances = self.cluster.instances().to_vec();
+        let mut instances = self.cluster.validator_instances().to_vec();
         let mut rng = ThreadRng::default();
         let mut stop_effects = vec![];
         let mut stopped_instance_ids = vec![];
@@ -639,12 +650,12 @@ impl ClusterTestRunner {
         let window = Duration::from_secs(60);
         loop {
             let job = self
-                .tx_emitter
-                .start_job(EmitJobRequest {
+                .runtime
+                .block_on(self.tx_emitter.start_job(EmitJobRequest {
                     instances: instances.clone(),
                     accounts_per_client: 10,
                     thread_params: EmitThreadParams::default(),
-                })
+                }))
                 .expect("Failed to start emit job");
             thread::sleep(Duration::from_secs(30) + window);
             let now = unix_timestamp_now();
@@ -702,7 +713,7 @@ impl ClusterTestRunner {
 
     fn wait_until_all_healthy(&mut self) -> Result<()> {
         let wait_deadline = Instant::now() + Duration::from_secs(20 * 60);
-        for instance in self.cluster.instances() {
+        for instance in self.cluster.validator_instances() {
             self.health_check_runner.invalidate(instance.peer_name());
         }
         loop {
@@ -761,7 +772,7 @@ impl ClusterTestRunner {
         info!("Will use suffix {} for log rotation", suffix);
         let jobs = self
             .cluster
-            .instances()
+            .validator_instances()
             .iter()
             .map(|instance| Self::wipe_instance(log_file, &suffix, instance));
         self.runtime.block_on(join_all(jobs));
@@ -770,7 +781,7 @@ impl ClusterTestRunner {
 
     async fn wipe_instance(log_file: &str, suffix: &str, instance: &Instance) {
         instance
-            .run_cmd_tee_err(vec!["sudo", "rm", "-rf", "/data/libra/*db"])
+            .run_cmd_tee_err(vec!["sudo", "rm", "-rf", "/data/libra/common"])
             .await
             .map_err(|e| info!("Failed to wipe {}: {:?}", instance, e))
             .ok();
@@ -785,7 +796,7 @@ impl ClusterTestRunner {
     }
 
     fn reboot(&mut self) {
-        let futures = self.cluster.instances().iter().map(|instance| {
+        let futures = self.cluster.validator_instances().iter().map(|instance| {
             async move {
                 let reboot = Reboot::new(instance.clone());
                 reboot
@@ -805,7 +816,7 @@ impl ClusterTestRunner {
     }
 
     fn cleanup(&mut self) {
-        let futures = self.cluster.instances().iter().map(|instance| {
+        let futures = self.cluster.validator_instances().iter().map(|instance| {
             async move {
                 RemoveNetworkEffects::new(instance.clone())
                     .apply()
@@ -835,7 +846,7 @@ impl ClusterTestRunner {
 
     fn make_stop_effects(&self) -> Vec<StopContainer> {
         self.cluster
-            .instances()
+            .validator_instances()
             .clone()
             .into_iter()
             .map(StopContainer::new)

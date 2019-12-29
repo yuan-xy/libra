@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::{pruner, LibraDB};
+use jellyfish_merkle::restore::JellyfishMerkleRestore;
 use libra_crypto::hash::CryptoHash;
 use libra_tools::tempdir::TempPath;
 use libra_types::{
@@ -241,16 +242,7 @@ proptest! {
         let tmp_dir = TempPath::new();
         let db = LibraDB::new(&tmp_dir);
         let store = &db.state_store;
-
-        for (i, (key, value)) in kvs.iter().enumerate() {
-            // Insert one key at each version.
-            let mut cs = ChangeSet::new();
-            let account_state_set: HashMap<_, _> = std::iter::once((*key, value.clone())).collect();
-            store
-                .put_account_state_sets(vec![account_state_set], i as Version, &mut cs)
-                .unwrap();
-            store.db.write_schemas(cs.batch).unwrap();
-        }
+        init_store(&store, kvs.clone().into_iter());
 
         // Test iterator at each version.
         for i in 0..kvs.len() {
@@ -265,5 +257,122 @@ proptest! {
             expected_values.sort_unstable_by_key(|item| item.0);
             prop_assert_eq!(actual_values, expected_values);
         }
+    }
+
+    #[test]
+    fn test_restore(
+        (input, batch1_size) in hash_map(any::<AccountAddress>(), any::<AccountStateBlob>(), 2..1000)
+            .prop_flat_map(|input| {
+                let len = input.len();
+                (Just(input), 1..len)
+            })
+    ) {
+        let tmp_dir1 = TempPath::new();
+        let db1 = LibraDB::new(&tmp_dir1);
+        let store1 = &db1.state_store;
+        init_store(&store1, input.clone().into_iter());
+
+        let version = (input.len() - 1) as Version;
+        let expected_root_hash = store1.get_root_hash(version).unwrap();
+
+        let tmp_dir2 = TempPath::new();
+        let db2 = LibraDB::new(&tmp_dir2);
+        let store2 = &db2.state_store;
+
+        let mut restore =
+            JellyfishMerkleRestore::new(&**store2, version, expected_root_hash).unwrap();
+
+        let mut ordered_input: Vec<_> = input
+            .into_iter()
+            .map(|(addr, value)| (addr.hash(), value))
+            .collect();
+        ordered_input.sort_unstable_by_key(|(key, _value)| *key);
+
+        let batch1: Vec<_> = ordered_input
+            .clone()
+            .into_iter()
+            .take(batch1_size)
+            .collect();
+        let rightmost_of_batch1 = batch1.last().map(|(key, _value)| *key).unwrap();
+        let proof_of_batch1 = store1
+            .get_account_state_range_proof(rightmost_of_batch1, version)
+            .unwrap();
+
+        restore.add_chunk(batch1, proof_of_batch1).unwrap();
+
+        let batch2: Vec<_> = ordered_input
+            .clone()
+            .into_iter()
+            .skip(batch1_size)
+            .collect();
+        let rightmost_of_batch2 = batch2.last().map(|(key, _value)| *key).unwrap();
+        let proof_of_batch2 = store1
+            .get_account_state_range_proof(rightmost_of_batch2, version)
+            .unwrap();
+
+        restore.add_chunk(batch2, proof_of_batch2).unwrap();
+
+        restore.finish().unwrap();
+
+        let actual_root_hash = store2.get_root_hash(version).unwrap();
+        prop_assert_eq!(actual_root_hash, expected_root_hash);
+    }
+
+    #[test]
+    fn test_get_rightmost_leaf(
+        (input, batch1_size) in hash_map(any::<AccountAddress>(), any::<AccountStateBlob>(), 2..1000)
+            .prop_flat_map(|input| {
+                let len = input.len();
+                (Just(input), 1..len)
+            })
+    ) {
+        let tmp_dir1 = TempPath::new();
+        let db1 = LibraDB::new(&tmp_dir1);
+        let store1 = &db1.state_store;
+        init_store(&store1, input.clone().into_iter());
+
+        let version = (input.len() - 1) as Version;
+        let expected_root_hash = store1.get_root_hash(version).unwrap();
+
+        let tmp_dir2 = TempPath::new();
+        let db2 = LibraDB::new(&tmp_dir2);
+        let store2 = &db2.state_store;
+
+        let mut restore =
+            JellyfishMerkleRestore::new(&**store2, version, expected_root_hash).unwrap();
+
+        let mut ordered_input: Vec<_> = input
+            .into_iter()
+            .map(|(addr, value)| (addr.hash(), value))
+            .collect();
+        ordered_input.sort_unstable_by_key(|(key, _value)| *key);
+
+        let batch1: Vec<_> = ordered_input
+            .clone()
+            .into_iter()
+            .take(batch1_size)
+            .collect();
+        let rightmost_of_batch1 = batch1.last().map(|(key, _value)| *key).unwrap();
+        let proof_of_batch1 = store1
+            .get_account_state_range_proof(rightmost_of_batch1, version)
+            .unwrap();
+
+        restore.add_chunk(batch1, proof_of_batch1).unwrap();
+
+        let expected = store2.get_rightmost_leaf_naive().unwrap();
+        let actual = store2.get_rightmost_leaf().unwrap();
+        prop_assert_eq!(actual, expected);
+    }
+}
+
+// Initializes the state store by inserting one key at each version.
+fn init_store(store: &StateStore, input: impl Iterator<Item = (AccountAddress, AccountStateBlob)>) {
+    for (i, (key, value)) in input.enumerate() {
+        let mut cs = ChangeSet::new();
+        let account_state_set: HashMap<_, _> = std::iter::once((key, value)).collect();
+        store
+            .put_account_state_sets(vec![account_state_set], i as Version, &mut cs)
+            .unwrap();
+        store.db.write_schemas(cs.batch).unwrap();
     }
 }

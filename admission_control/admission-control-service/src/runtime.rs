@@ -6,14 +6,13 @@ use crate::{
     counters,
     upstream_proxy::{process_network_messages, UpstreamProxyData},
 };
-use admission_control_proto::proto::admission_control::create_admission_control;
+use admission_control_proto::proto::admission_control::admission_control_server::AdmissionControlServer;
 use futures::channel::mpsc;
-use grpc_helpers::ServerHandle;
-use grpcio::{ChannelBuilder, EnvBuilder, ServerBuilder};
+use grpcio::EnvBuilder;
 use libra_config::config::{NodeConfig, RoleType};
-use libra_mempool::proto::mempool::MempoolClient;
+use libra_mempool::proto::mempool_client::MempoolClientWrapper;
 use network::validator_network::{AdmissionControlNetworkEvents, AdmissionControlNetworkSender};
-use std::{cmp::min, collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::ToSocketAddrs, sync::Arc};
 use storage_client::{StorageRead, StorageReadServiceClient};
 use tokio::runtime::{Builder, Runtime};
 use vm_validator::vm_validator::VMValidator;
@@ -21,7 +20,7 @@ use vm_validator::vm_validator::VMValidator;
 /// Handle for AdmissionControl Runtime
 pub struct AdmissionControlRuntime {
     /// gRPC server to serve request between client and AC
-    _grpc_server: ServerHandle,
+    _ac_service_rt: Runtime,
     /// separate AC runtime
     _upstream_proxy: Runtime,
 }
@@ -33,23 +32,22 @@ impl AdmissionControlRuntime {
         network_sender: AdmissionControlNetworkSender,
         network_events: Vec<AdmissionControlNetworkEvents>,
     ) -> Self {
+        let ac_service_rt = Builder::new()
+            .thread_name("ac-service-")
+            .threaded_scheduler()
+            .enable_all()
+            .build()
+            .expect("[admission control] failed to create runtime");
         let (ac_sender, ac_receiver) = mpsc::channel(1_024);
 
-        let env = Arc::new(
-            EnvBuilder::new()
-                .name_prefix("grpc-ac-")
-                .cq_count(min(num_cpus::get() * 2, 32))
-                .build(),
-        );
         let port = config.admission_control.admission_control_service_port;
 
         // Create mempool client if the node is validator.
-        let connection_str = format!("localhost:{}", config.mempool.mempool_service_port);
-        let env2 = Arc::new(EnvBuilder::new().name_prefix("grpc-ac-mem-").build());
         let mempool_client = if config.base.role == RoleType::Validator {
-            Some(Arc::new(MempoolClient::new(
-                ChannelBuilder::new(env2).connect(&connection_str),
-            )))
+            Some(MempoolClientWrapper::new(
+                "localhost",
+                config.mempool.mempool_service_port,
+            ))
         } else {
             None
         };
@@ -64,14 +62,22 @@ impl AdmissionControlRuntime {
         let admission_control_service =
             AdmissionControlService::new(ac_sender, Arc::clone(&storage_client));
 
-        let vm_validator = Arc::new(VMValidator::new(&config, Arc::clone(&storage_client)));
+        let vm_validator = Arc::new(VMValidator::new(
+            &config,
+            Arc::clone(&storage_client),
+            ac_service_rt.handle().clone(),
+        ));
 
-        let service = create_admission_control(admission_control_service);
-        let server = ServerBuilder::new(Arc::clone(&env))
-            .register_service(service)
-            .bind(config.admission_control.address.clone(), port)
-            .build()
-            .expect("Unable to create grpc server");
+        let addr = format!("{}:{}", config.admission_control.address, port)
+            .to_socket_addrs()
+            .unwrap()
+            .next()
+            .unwrap();
+        ac_service_rt.spawn(
+            tonic::transport::Server::builder()
+                .add_service(AdmissionControlServer::new(admission_control_service))
+                .serve(addr),
+        );
 
         let upstream_proxy_runtime = Builder::new()
             .thread_name("ac-upstream-proxy-")
@@ -109,7 +115,7 @@ impl AdmissionControlRuntime {
         ));
 
         Self {
-            _grpc_server: ServerHandle::setup(server),
+            _ac_service_rt: ac_service_rt,
             _upstream_proxy: upstream_proxy_runtime,
         }
     }

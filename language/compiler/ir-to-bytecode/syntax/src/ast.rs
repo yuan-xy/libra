@@ -166,14 +166,16 @@ pub enum Kind {
 pub enum Type {
     /// `address`
     Address,
+    /// `u8`
+    U8,
     /// `u64`
     U64,
+    /// `u128`
+    U128,
     /// `bool`
     Bool,
     /// `bytearray`
     ByteArray,
-    /// `string`, currently unused
-    String,
     /// A module defined struct
     Struct(QualifiedStructIdent, Vec<Type>),
     /// A reference type, the bool flag indicates whether the reference is mutable
@@ -315,18 +317,8 @@ pub enum Builtin {
     /// Get a reference to the resource(`StructName` resolved by current module) associated
     /// with the given address
     BorrowGlobal(bool, StructName, Vec<Type>),
-    /// Returns the price per gas unit the current transaction is willing to pay
-    GetTxnGasUnitPrice,
-    /// Returns the maximum units of gas the current transaction is willing to use
-    GetTxnMaxGasUnits,
-    /// Returns the public key of the current transaction's sender
-    GetTxnPublicKey,
     /// Returns the address of the current transaction's sender
     GetTxnSender,
-    /// Returns the sequence number of the current transaction.
-    GetTxnSequenceNumber,
-    /// Returns the unit of gas remain to be used for now.
-    GetGasRemaining,
 
     /// Remove a resource of the given type from the account with the given address
     MoveFrom(StructName, Vec<Type>),
@@ -335,6 +327,13 @@ pub enum Builtin {
 
     /// Convert a mutable reference into an immutable one
     Freeze,
+
+    /// Cast an integer into u8.
+    ToU8,
+    /// Cast an integer into u64.
+    ToU64,
+    /// Cast an integer into u128.
+    ToU128,
 }
 
 /// Enum for different function calls
@@ -447,14 +446,16 @@ pub type Block_ = Spanned<Block>;
 pub enum CopyableVal {
     /// An address in the global storage
     Address(AccountAddress),
+    /// An unsigned 8-bit integer
+    U8(u8),
     /// An unsigned 64-bit integer
     U64(u64),
+    /// An unsigned 128-bit integer
+    U128(u128),
     /// true or false
     Bool(bool),
     /// `b"<bytes>"`
     ByteArray(ByteArray),
-    /// Not yet supported in the parser
-    String(String),
 }
 
 /// The type of a value and its location
@@ -490,6 +491,10 @@ pub enum BinOp {
     BitAnd,
     /// `^`
     Xor,
+    /// `<<`
+    Shl,
+    /// `>>`
+    Shr,
 
     // Bool ops
     /// `&&`
@@ -1324,11 +1329,12 @@ fn format_type_formals(formals: &[(TypeVar_, Kind)]) -> String {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Type::U8 => write!(f, "u8"),
             Type::U64 => write!(f, "u64"),
+            Type::U128 => write!(f, "u128"),
             Type::Bool => write!(f, "bool"),
             Type::Address => write!(f, "address"),
             Type::ByteArray => write!(f, "bytearray"),
-            Type::String => write!(f, "string"),
             Type::Struct(ident, tys) => write!(f, "{}{}", ident, format_type_actuals(tys)),
             Type::Reference(is_mutable, t) => {
                 write!(f, "&{}{}", if *is_mutable { "mut " } else { "" }, t)
@@ -1358,17 +1364,15 @@ impl fmt::Display for Builtin {
                     format_type_actuals(tys)
                 )
             }
-            Builtin::GetTxnMaxGasUnits => write!(f, "get_txn_max_gas_units"),
-            Builtin::GetTxnGasUnitPrice => write!(f, "get_txn_gas_unit_price"),
-            Builtin::GetTxnPublicKey => write!(f, "get_txn_public_key"),
             Builtin::GetTxnSender => write!(f, "get_txn_sender"),
-            Builtin::GetTxnSequenceNumber => write!(f, "get_txn_sequence_number"),
-            Builtin::GetGasRemaining => write!(f, "get_gas_remaining"),
             Builtin::MoveFrom(t, tys) => write!(f, "move_from<{}{}>", t, format_type_actuals(tys)),
             Builtin::MoveToSender(t, tys) => {
                 write!(f, "move_to_sender<{}{}>", t, format_type_actuals(tys))
             }
             Builtin::Freeze => write!(f, "freeze"),
+            Builtin::ToU8 => write!(f, "to_u8"),
+            Builtin::ToU64 => write!(f, "to_u64"),
+            Builtin::ToU128 => write!(f, "to_u128"),
         }
     }
 }
@@ -1495,11 +1499,12 @@ impl fmt::Display for Block {
 impl fmt::Display for CopyableVal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            CopyableVal::U8(v) => write!(f, "{}u8", v),
             CopyableVal::U64(v) => write!(f, "{}", v),
+            CopyableVal::U128(v) => write!(f, "{}u128", v),
             CopyableVal::Bool(v) => write!(f, "{}", v),
             CopyableVal::ByteArray(v) => write!(f, "{}", v),
             CopyableVal::Address(v) => write!(f, "0x{}", hex::encode(&v)),
-            CopyableVal::String(v) => write!(f, "{}", v),
         }
     }
 }
@@ -1530,6 +1535,8 @@ impl fmt::Display for BinOp {
                 BinOp::BitOr => "|",
                 BinOp::BitAnd => "&",
                 BinOp::Xor => "^",
+                BinOp::Shl => "<<",
+                BinOp::Shr => ">>",
 
                 // Bool ops
                 BinOp::Or => "||",

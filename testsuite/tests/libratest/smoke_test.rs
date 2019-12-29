@@ -6,50 +6,58 @@ use cli::{
     TransactionArgument, TransactionPayload,
 };
 use libra_config::config::{NodeConfig, RoleType};
-use libra_crypto::{ed25519::*, test_utils::KeyPair, SigningKey};
+use libra_crypto::{ed25519::*, test_utils::KeyPair, HashValue, SigningKey};
 use libra_logger::prelude::*;
 use libra_swarm::swarm::LibraNode;
 use libra_swarm::{swarm::LibraSwarm, utils};
 use libra_tools::tempdir::TempPath;
+use libra_types::block_info::BlockInfo;
+use libra_types::ledger_info::LedgerInfo;
+use libra_types::waypoint::Waypoint;
 use num_traits::cast::FromPrimitive;
 use rust_decimal::Decimal;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::str::FromStr;
 use std::{thread, time};
 
 struct TestEnvironment {
     validator_swarm: LibraSwarm,
     full_node_swarm: Option<LibraSwarm>,
-    faucet_key: (
-        KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
-        String,
-        Option<TempPath>,
-    ),
+    faucet_key: (KeyPair<Ed25519PrivateKey, Ed25519PublicKey>, String),
     mnemonic_file: TempPath,
 }
 
 impl TestEnvironment {
     fn new(num_validators: usize) -> Self {
         ::libra_logger::init_for_e2e_testing();
-        let faucet_key = generate_keypair::load_faucet_key_or_create_default(None);
-        let validator_swarm = LibraSwarm::configure_swarm(
-            num_validators,
-            RoleType::Validator,
-            faucet_key.0.clone(),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let validator_swarm =
+            LibraSwarm::configure_swarm(num_validators, RoleType::Validator, None, None, None)
+                .unwrap();
 
         let mnemonic_file = libra_tools::tempdir::TempPath::new();
         mnemonic_file
             .create_as_file()
             .expect("could not create temporary mnemonic_file_path");
+
+        let mut key_file = File::open(&validator_swarm.config.faucet_key_path)
+            .expect("Unable to create faucet key file");
+        let mut serialized_key = Vec::new();
+        key_file
+            .read_to_end(&mut serialized_key)
+            .expect("Unable to read serialized faucet key");
+        let keypair = lcs::from_bytes(&serialized_key).expect("Unable to deserialize faucet key");
+        let keypair_path = validator_swarm
+            .config
+            .faucet_key_path
+            .to_str()
+            .expect("Unable to read faucet path")
+            .to_string();
+
         Self {
             validator_swarm,
             full_node_swarm: None,
-            faucet_key,
+            faucet_key: (keypair, keypair_path),
             mnemonic_file,
         }
     }
@@ -59,7 +67,6 @@ impl TestEnvironment {
             LibraSwarm::configure_swarm(
                 num_full_nodes,
                 RoleType::FullNode,
-                self.faucet_key.0.clone(),
                 None,
                 None,
                 Some(String::from(
@@ -94,14 +101,7 @@ impl TestEnvironment {
         panic!("Max out {} attempts to launch test swarm", num_attempts);
     }
 
-    fn get_ac_client(&self, port: u16) -> ClientProxy {
-        let config = NodeConfig::load(&self.validator_swarm.config.config_files[0]).unwrap();
-        let validator_set_file = self
-            .validator_swarm
-            .dir
-            .as_ref()
-            .join("0")
-            .join(&config.consensus.consensus_peers_file);
+    fn get_ac_client(&self, port: u16, waypoint: Option<Waypoint>) -> ClientProxy {
         let mnemonic_file_path = self
             .mnemonic_file
             .path()
@@ -115,25 +115,33 @@ impl TestEnvironment {
         ClientProxy::new(
             "localhost",
             port,
-            validator_set_file.to_str().unwrap(),
             &self.faucet_key.1,
             false,
             /* faucet server */ None,
             Some(mnemonic_file_path),
+            waypoint,
         )
         .unwrap()
     }
 
-    fn get_validator_ac_client(&self, node_index: usize) -> ClientProxy {
+    fn get_validator_ac_client(
+        &self,
+        node_index: usize,
+        waypoint: Option<Waypoint>,
+    ) -> ClientProxy {
         let port = self.validator_swarm.get_ac_port(node_index);
-        self.get_ac_client(port)
+        self.get_ac_client(port, waypoint)
     }
 
-    fn get_full_node_ac_client(&self, node_index: usize) -> ClientProxy {
+    fn get_full_node_ac_client(
+        &self,
+        node_index: usize,
+        waypoint: Option<Waypoint>,
+    ) -> ClientProxy {
         match &self.full_node_swarm {
             Some(swarm) => {
                 let port = swarm.get_ac_port(node_index);
-                self.get_ac_client(port)
+                self.get_ac_client(port, waypoint)
             }
             None => {
                 panic!("Full Node swarm is not initialized");
@@ -152,7 +160,7 @@ fn setup_swarm_and_client_proxy(
 ) -> (TestEnvironment, ClientProxy) {
     let mut env = TestEnvironment::new(num_nodes);
     env.launch_swarm(RoleType::Validator);
-    let ac_client = env.get_validator_ac_client(client_port_index);
+    let ac_client = env.get_validator_ac_client(client_port_index, None);
     (env, ac_client)
 }
 
@@ -390,7 +398,7 @@ fn test_startup_sync_state() {
         .is_ok());
     // create the client for the restarted node
     let accounts = client_proxy_1.copy_all_accounts();
-    let mut client_proxy_0 = env.get_validator_ac_client(0);
+    let mut client_proxy_0 = env.get_validator_ac_client(0, None);
     let sender_address = accounts[0].address;
     client_proxy_0.set_accounts(accounts);
     client_proxy_0.wait_for_transaction(sender_address, 1);
@@ -466,7 +474,7 @@ fn test_basic_state_synchronization() {
     assert!(env.validator_swarm.wait_for_all_nodes_to_catchup());
 
     // Connect to the newly recovered node and verify its state
-    let mut client_proxy2 = env.get_validator_ac_client(node_to_restart);
+    let mut client_proxy2 = env.get_validator_ac_client(node_to_restart, None);
     client_proxy2.set_accounts(client_proxy.copy_all_accounts());
     assert_eq!(
         Decimal::from_f64(85.0),
@@ -581,12 +589,12 @@ fn test_full_node_basic_flow() {
     env.launch_swarm(RoleType::FullNode);
 
     // execute smoke script
-    test_smoke_script(env.get_validator_ac_client(0));
+    test_smoke_script(env.get_validator_ac_client(0, None));
 
     // read state from full node client
-    let mut validator_ac_client = env.get_validator_ac_client(1);
-    let mut full_node_client = env.get_full_node_ac_client(1);
-    let mut full_node_client_2 = env.get_full_node_ac_client(0);
+    let mut validator_ac_client = env.get_validator_ac_client(1, None);
+    let mut full_node_client = env.get_full_node_ac_client(1, None);
+    let mut full_node_client_2 = env.get_full_node_ac_client(0, None);
     for idx in 0..3 {
         validator_ac_client.create_next_account(false).unwrap();
         full_node_client.create_next_account(false).unwrap();
@@ -699,9 +707,9 @@ fn test_full_node_basic_flow() {
 
 #[test]
 fn test_e2e_reconfiguration() {
-    let (mut env, mut client_proxy_1) = setup_swarm_and_client_proxy(5, 1);
+    let (mut env, mut client_proxy_1) = setup_swarm_and_client_proxy(3, 1);
     // the client connected to the removed validator
-    let mut client_proxy_0 = env.get_validator_ac_client(0);
+    let mut client_proxy_0 = env.get_validator_ac_client(0, None);
     client_proxy_1.create_next_account(false).unwrap();
     client_proxy_0.set_accounts(client_proxy_1.copy_all_accounts());
     client_proxy_1
@@ -717,8 +725,15 @@ fn test_e2e_reconfiguration() {
         Decimal::from_f64(10.0),
         Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
     );
-    let peer_id = env.get_validator(0).unwrap().validator_peer_id().unwrap();
-    client_proxy_1.remove_validator(peer_id, true).unwrap();
+    let peer_id = env
+        .get_validator(0)
+        .unwrap()
+        .validator_peer_id()
+        .unwrap()
+        .to_string();
+    client_proxy_1
+        .remove_validator(&["remove_validator", &peer_id], true)
+        .unwrap();
     // mint another 10 coins after remove node 0
     client_proxy_1
         .mint_coins(&["mintb", "0", "10"], true)
@@ -733,11 +748,80 @@ fn test_e2e_reconfiguration() {
         Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
     );
     // Add the node back
-    client_proxy_1.add_validator(peer_id, true).unwrap();
+    client_proxy_1
+        .add_validator(&["add_validator", &peer_id], true)
+        .unwrap();
     // Wait for it catches up, mint1 + remove + mint2 + add => seq == 4
     client_proxy_0.wait_for_transaction(association_address(), 4);
     assert_eq!(
         Decimal::from_f64(20.0),
         Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
     );
+}
+
+#[test]
+fn test_client_waypoints() {
+    let (mut env, mut client_proxy) = setup_swarm_and_client_proxy(3, 1);
+    // Make sure some txns are committed
+    client_proxy.create_next_account(false).unwrap();
+    client_proxy
+        .mint_coins(&["mintb", "0", "10"], true)
+        .unwrap();
+
+    // Create the waypoint for the initial epoch
+    let genesis_li = client_proxy
+        .latest_epoch_change_li()
+        .expect("Failed to retrieve genesis LedgerInfo");
+    assert_eq!(genesis_li.ledger_info().epoch(), 0);
+    let genesis_waypoint = Waypoint::new(genesis_li.ledger_info())
+        .expect("Failed to generate waypoint from genesis LI");
+
+    // Start another client with the genesis waypoint and make sure it successfully connects
+    let mut client_with_waypoint = env.get_validator_ac_client(0, Some(genesis_waypoint.clone()));
+    client_with_waypoint.test_validator_connection().unwrap();
+    assert_eq!(
+        client_with_waypoint.latest_epoch_change_li().unwrap(),
+        genesis_li
+    );
+
+    // Start next epoch
+    let peer_id = env
+        .get_validator(0)
+        .unwrap()
+        .validator_peer_id()
+        .unwrap()
+        .to_string();
+    client_proxy
+        .remove_validator(&["remove_validator", &peer_id], true)
+        .unwrap();
+    client_proxy
+        .mint_coins(&["mintb", "0", "10"], true)
+        .unwrap();
+    assert_eq!(
+        Decimal::from_f64(20.0),
+        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
+    );
+    let epoch_1_li = client_proxy
+        .latest_epoch_change_li()
+        .expect("Failed to retrieve end of epoch 1 LedgerInfo");
+
+    assert_eq!(epoch_1_li.ledger_info().epoch(), 1);
+    let epoch_1_waypoint = Waypoint::new(epoch_1_li.ledger_info())
+        .expect("Failed to generate waypoint from end of epoch 1");
+
+    // Start a client with the waypoint for end of epoch 1 and make sure it successfully connects
+    client_with_waypoint = env.get_validator_ac_client(1, Some(epoch_1_waypoint.clone()));
+    client_with_waypoint.test_validator_connection().unwrap();
+    assert_eq!(
+        client_with_waypoint.latest_epoch_change_li().unwrap(),
+        epoch_1_li
+    );
+
+    // Verify that a client with the wrong waypoint is not going to be able to connect to the chain.
+    let bad_li = LedgerInfo::new(BlockInfo::genesis(), HashValue::zero());
+    let bad_waypoint = Waypoint::new(&bad_li).unwrap();
+    let mut client_with_bad_waypoint = env.get_validator_ac_client(1, Some(bad_waypoint));
+    assert!(client_with_bad_waypoint
+        .test_validator_connection()
+        .is_err());
 }

@@ -28,6 +28,7 @@ use libra_crypto::{
 };
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
+use serde::{Deserialize, Serialize};
 use std::convert::{TryFrom, TryInto};
 use std::marker::PhantomData;
 
@@ -430,7 +431,7 @@ impl From<AccumulatorConsistencyProof> for crate::proto::types::AccumulatorConsi
 ///
 /// if the proof wants to show that `[a, b, c]` exists in the accumulator, it would need `X` on the
 /// left and `Y` and `Z` on the right.
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AccumulatorRangeProof<H> {
     /// The siblings on the left of the path from the first leaf to the root. Siblings near the root
     /// are at the beginning of the vector.
@@ -629,22 +630,40 @@ pub type TestAccumulatorRangeProof = AccumulatorRangeProof<TestOnlyHasher>;
 ///
 /// if the proof wants show that `[a, b, c, d, e]` exists in the tree, it would need the siblings
 /// `X` and `h` on the right.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SparseMerkleRangeProof {
-    /// The vector of siblings. The ones near the bottom are at the beginning of the vector. In the
-    /// above example, it's `[X, h]`.
-    siblings: Vec<HashValue>,
+    /// The vector of siblings on the right of the path from root to last leaf. The ones near the
+    /// bottom are at the beginning of the vector. In the above example, it's `[X, h]`.
+    right_siblings: Vec<HashValue>,
 }
 
 impl SparseMerkleRangeProof {
     /// Constructs a new `SparseMerkleRangeProof`.
-    pub fn new(siblings: Vec<HashValue>) -> Self {
-        Self { siblings }
+    pub fn new(right_siblings: Vec<HashValue>) -> Self {
+        Self { right_siblings }
     }
 
     /// Returns the siblings.
-    pub fn siblings(&self) -> &[HashValue] {
-        &self.siblings
+    pub fn right_siblings(&self) -> &[HashValue] {
+        &self.right_siblings
+    }
+}
+
+impl TryFrom<crate::proto::types::SparseMerkleRangeProof> for SparseMerkleRangeProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::SparseMerkleRangeProof) -> Result<Self> {
+        let right_siblings =
+            from_proto_siblings(proto_proof.right_siblings, *SPARSE_MERKLE_PLACEHOLDER_HASH)?;
+        Ok(Self::new(right_siblings))
+    }
+}
+
+impl From<SparseMerkleRangeProof> for crate::proto::types::SparseMerkleRangeProof {
+    fn from(proof: SparseMerkleRangeProof) -> Self {
+        let right_siblings =
+            into_proto_siblings(proof.right_siblings, *SPARSE_MERKLE_PLACEHOLDER_HASH);
+        Self { right_siblings }
     }
 }
 
@@ -974,7 +993,7 @@ impl From<EventProof> for crate::proto::types::EventProof {
 }
 
 /// The complete proof used to authenticate a list of consecutive transactions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct TransactionListProof {
     /// The accumulator range proof from ledger info root to leaves that authenticates the hashes

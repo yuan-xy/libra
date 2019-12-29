@@ -4,9 +4,6 @@
 set -ex
 
 declare -a params
-if [ -n "${IPV4}" ]; then
-	    params+="-4 "
-fi
 if [ -n "${CFG_BASE_CONFIG}" ]; then # Path to base config
 	    params+="-t ${CFG_BASE_CONFIG} "
 fi
@@ -29,6 +26,9 @@ if [ -n "${CFG_SEED_PEER_IP}" ]; then # Seed peer ip for discovery
 	    params+="--bootstrap /ip4/${CFG_SEED_PEER_IP}/tcp/6180 "
 fi
 
-/opt/libra/bin/dynamic-config-builder --data-dir /opt/libra/etc --output-dir /opt/libra/etc/ ${params[@]}
+/opt/libra/bin/validator-config-builder \
+    --data-dir /opt/libra/data/common \
+    --output-dir /opt/libra/etc/ \
+    ${params[@]}
 
 exec /opt/libra/bin/libra-node -f /opt/libra/etc/node.config.toml

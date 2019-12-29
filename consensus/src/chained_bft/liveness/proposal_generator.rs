@@ -40,7 +40,7 @@ pub struct ProposalGenerator<T> {
     // proposed block.
     block_store: Arc<dyn BlockReader<Payload = T> + Send + Sync>,
     // Transaction manager is delivering the transactions.
-    txn_manager: Arc<dyn TxnManager<Payload = T>>,
+    txn_manager: Box<dyn TxnManager<Payload = T>>,
     // Time service to generate block timestamps
     time_service: Arc<dyn TimeService>,
     // Max number of transactions to be added to a proposed block.
@@ -53,7 +53,7 @@ impl<T: Payload> ProposalGenerator<T> {
     pub fn new(
         author: Author,
         block_store: Arc<dyn BlockReader<Payload = T> + Send + Sync>,
-        txn_manager: Arc<dyn TxnManager<Payload = T>>,
+        txn_manager: Box<dyn TxnManager<Payload = T>>,
         time_service: Arc<dyn TimeService>,
         max_block_size: u64,
     ) -> Self {
@@ -101,7 +101,7 @@ impl<T: Payload> ProposalGenerator<T> {
     /// 3. In case a given round is not greater than the calculated parent, return an OldRound
     /// error.
     pub async fn generate_proposal(
-        &self,
+        &mut self,
         round: Round,
         round_deadline: Instant,
     ) -> anyhow::Result<BlockData<T>> {

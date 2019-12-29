@@ -18,7 +18,7 @@ FROM toolchain AS builder
 
 COPY . /libra
 
-RUN cargo build --release -p libra-node -p client -p dynamic-config-builder && cd target/release && rm -r build deps incremental
+RUN cargo build --release -p libra-node -p client -p config-builder && cd target/release && rm -r build deps incremental
 
 ### Production Image ###
 FROM debian:buster AS prod
@@ -34,7 +34,7 @@ RUN pip3 install -r /libra/docker/mint/requirements.txt
 RUN mkdir -p /opt/libra/bin  /libra/client/data/wallet/
 
 COPY --from=builder /libra/target/release/client /opt/libra/bin
-COPY --from=builder /libra/target/release/dynamic-config-builder /opt/libra/bin
+COPY --from=builder /libra/target/release/faucet-config-builder /opt/libra/bin
 COPY docker/mint/server.py /opt/libra/bin
 COPY docker/mint/docker-run.sh /opt/libra/bin
 
@@ -42,7 +42,6 @@ COPY docker/mint/docker-run.sh /opt/libra/bin
 EXPOSE 8000
 
 # Define CFG_SEED, AC_HOST and AC_PORT environment variables when running
-# Note the various addrs aren't used, but are needed so dynamic-config-builder doesn't complain
 CMD /opt/libra/bin/docker-run.sh
 
 ARG BUILD_DATE

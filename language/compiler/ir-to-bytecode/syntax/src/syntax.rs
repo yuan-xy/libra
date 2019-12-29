@@ -1,6 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use anyhow::Context;
 use codespan::{ByteIndex, Span};
 use std::fmt;
 use std::str::FromStr;
@@ -61,6 +62,16 @@ fn consume_token<'input>(
     Ok(())
 }
 
+fn adjust_token<'input>(
+    tokens: &mut Lexer<'input>,
+    list_end_token: Tok,
+) -> Result<(), ParseError<usize, anyhow::Error>> {
+    if tokens.peek() == Tok::GreaterGreater && list_end_token == Tok::Greater {
+        tokens.replace_token(Tok::Greater, 1)?;
+    }
+    Ok(())
+}
+
 fn parse_comma_list<'input, F, R>(
     tokens: &mut Lexer<'input>,
     list_end_token: Tok,
@@ -71,14 +82,17 @@ where
     F: Fn(&mut Lexer<'input>) -> Result<R, ParseError<usize, anyhow::Error>>,
 {
     let mut v = vec![];
+    adjust_token(tokens, list_end_token)?;
     if tokens.peek() != list_end_token {
         loop {
             v.push(parse_list_item(tokens)?);
+            adjust_token(tokens, list_end_token)?;
             if tokens.peek() == list_end_token {
                 break;
             }
             consume_token(tokens, Tok::Comma)?;
-            if allow_trailing_comma && tokens.peek() == list_end_token {
+            adjust_token(tokens, list_end_token)?;
+            if tokens.peek() == list_end_token && allow_trailing_comma {
                 break;
             }
         }
@@ -139,13 +153,14 @@ fn parse_account_address<'input>(
             location: tokens.start_loc(),
         });
     }
-    let addr = AccountAddress::from_hex_literal(&tokens.content()).unwrap_or_else(|_| {
-        // The lexer guarantees this, but tracking it all the way to here is tedious.
-        unreachable!(
-            "The address {:?} is of invalid length. Addresses are at most 32-bytes long",
-            tokens.content()
-        )
-    });
+    let addr = AccountAddress::from_hex_literal(&tokens.content())
+        .with_context(|| {
+            format!(
+                "The address {:?} is of invalid length. Addresses are at most 32-bytes long",
+                tokens.content()
+            )
+        })
+        .unwrap();
     tokens.advance()?;
     Ok(addr)
 }
@@ -205,10 +220,32 @@ fn parse_copyable_val_<'input>(
             tokens.advance()?;
             CopyableVal::Bool(false)
         }
+        Tok::U8Value => {
+            let mut s = tokens.content();
+            if s.ends_with("u8") {
+                s = &s[..s.len() - 2]
+            }
+            let i = u8::from_str(s).unwrap();
+            tokens.advance()?;
+            CopyableVal::U8(i)
+        }
         Tok::U64Value => {
-            let i = u64::from_str(tokens.content()).unwrap();
+            let mut s = tokens.content();
+            if s.ends_with("u64") {
+                s = &s[..s.len() - 3]
+            }
+            let i = u64::from_str(s).unwrap();
             tokens.advance()?;
             CopyableVal::U64(i)
+        }
+        Tok::U128Value => {
+            let mut s = tokens.content();
+            if s.ends_with("u128") {
+                s = &s[..s.len() - 4]
+            }
+            let i = u128::from_str(s).unwrap();
+            tokens.advance()?;
+            CopyableVal::U128(i)
         }
         Tok::ByteArrayValue => {
             let s = tokens.content();
@@ -248,11 +285,13 @@ fn get_precedence(token: &Tok) -> u32 {
         Tok::Pipe => 5,
         Tok::Caret => 6,
         Tok::Amp => 7,
-        Tok::Plus => 8,
-        Tok::Minus => 8,
-        Tok::Star => 9,
-        Tok::Slash => 9,
-        Tok::Percent => 9,
+        Tok::LessLess => 8,
+        Tok::GreaterGreater => 8,
+        Tok::Plus => 9,
+        Tok::Minus => 9,
+        Tok::Star => 10,
+        Tok::Slash => 10,
+        Tok::Percent => 10,
         _ => 0, // anything else is not a binary operator
     }
 }
@@ -299,6 +338,8 @@ fn parse_rhs_of_binary_exp<'input>(
             Tok::PipePipe => BinOp::Or,
             Tok::AmpAmp => BinOp::And,
             Tok::Caret => BinOp::Xor,
+            Tok::LessLess => BinOp::Shl,
+            Tok::GreaterGreater => BinOp::Shr,
             Tok::Pipe => BinOp::BitOr,
             Tok::Amp => BinOp::BitAnd,
             Tok::Plus => BinOp::Add,
@@ -333,15 +374,13 @@ fn parse_qualified_function_name_<'input>(
         Tok::Exists
         | Tok::BorrowGlobal
         | Tok::BorrowGlobalMut
-        | Tok::GetTxnGasUnitPrice
-        | Tok::GetTxnMaxGasUnits
-        | Tok::GetTxnPublicKey
         | Tok::GetTxnSender
-        | Tok::GetTxnSequenceNumber
         | Tok::MoveFrom
         | Tok::MoveToSender
-        | Tok::GetGasRemaining
-        | Tok::Freeze => {
+        | Tok::Freeze
+        | Tok::ToU8
+        | Tok::ToU64
+        | Tok::ToU128 => {
             let f = parse_builtin(tokens)?;
             FunctionCall::Builtin(f)
         }
@@ -469,16 +508,14 @@ fn parse_call_or_term<'input>(
         Tok::Exists
         | Tok::BorrowGlobal
         | Tok::BorrowGlobalMut
-        | Tok::GetTxnGasUnitPrice
-        | Tok::GetTxnMaxGasUnits
-        | Tok::GetTxnPublicKey
         | Tok::GetTxnSender
-        | Tok::GetTxnSequenceNumber
         | Tok::MoveFrom
         | Tok::MoveToSender
-        | Tok::GetGasRemaining
         | Tok::Freeze
-        | Tok::DotNameValue => {
+        | Tok::DotNameValue
+        | Tok::ToU8
+        | Tok::ToU64
+        | Tok::ToU128 => {
             let f = parse_qualified_function_name_(tokens)?;
             let exp = parse_call_or_term_(tokens)?;
             Ok(Exp::FunctionCall(f, Box::new(exp)))
@@ -558,9 +595,13 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, ParseError<usiz
             let v = parse_var_(tokens)?;
             Ok(Exp::BorrowLocal(false, v))
         }
-        Tok::AccountAddressValue | Tok::True | Tok::False | Tok::U64Value | Tok::ByteArrayValue => {
-            Ok(Exp::Value(parse_copyable_val_(tokens)?))
-        }
+        Tok::AccountAddressValue
+        | Tok::True
+        | Tok::False
+        | Tok::U8Value
+        | Tok::U64Value
+        | Tok::U128Value
+        | Tok::ByteArrayValue => Ok(Exp::Value(parse_copyable_val_(tokens)?)),
         Tok::NameValue | Tok::NameBeginTyValue => {
             let (name, type_actuals) = parse_name_and_type_actuals(tokens)?;
             parse_pack(tokens, &name, type_actuals)
@@ -612,18 +653,29 @@ fn parse_module_name<'input>(
     ModuleName::parse(parse_name(tokens)?)
 }
 
+fn consume_end_of_generics<'input>(
+    tokens: &mut Lexer<'input>,
+) -> Result<(), ParseError<usize, anyhow::Error>> {
+    match tokens.peek() {
+        Tok::Greater => tokens.advance(),
+        Tok::GreaterGreater => {
+            tokens.replace_token(Tok::Greater, 1)?;
+            tokens.advance()?;
+            Ok(())
+        }
+        _ => Err(ParseError::InvalidToken {
+            location: tokens.start_loc(),
+        }),
+    }
+}
+
 // Builtin: Builtin = {
 //     "exists<" <name_and_type_actuals: NameAndTypeActuals> ">" =>? { ... },
 //     "borrow_global<" <name_and_type_actuals: NameAndTypeActuals> ">" =>? { ... },
 //     "borrow_global_mut<" <name_and_type_actuals: NameAndTypeActuals> ">" =>? { ... },
-//     "get_txn_gas_unit_price" => Builtin::GetTxnGasUnitPrice,
-//     "get_txn_max_gas_units" => Builtin::GetTxnMaxGasUnits,
-//     "get_txn_public_key" => Builtin::GetTxnPublicKey,
 //     "get_txn_sender" => Builtin::GetTxnSender,
-//     "get_txn_sequence_number" => Builtin::GetTxnSequenceNumber,
 //     "move_from<" <name_and_type_actuals: NameAndTypeActuals> ">" =>? { ... },
 //     "move_to_sender<" <name_and_type_actuals: NameAndTypeActuals> ">" =>? { ...},
-//     "get_gas_remaining" => Builtin::GetGasRemaining,
 //     "freeze" => Builtin::Freeze,
 // }
 
@@ -634,13 +686,13 @@ fn parse_builtin<'input>(
         Tok::Exists => {
             tokens.advance()?;
             let (name, type_actuals) = parse_name_and_type_actuals(tokens)?;
-            consume_token(tokens, Tok::Greater)?;
+            consume_end_of_generics(tokens)?;
             Ok(Builtin::Exists(StructName::parse(name)?, type_actuals))
         }
         Tok::BorrowGlobal => {
             tokens.advance()?;
             let (name, type_actuals) = parse_name_and_type_actuals(tokens)?;
-            consume_token(tokens, Tok::Greater)?;
+            consume_end_of_generics(tokens)?;
             Ok(Builtin::BorrowGlobal(
                 false,
                 StructName::parse(name)?,
@@ -650,55 +702,47 @@ fn parse_builtin<'input>(
         Tok::BorrowGlobalMut => {
             tokens.advance()?;
             let (name, type_actuals) = parse_name_and_type_actuals(tokens)?;
-            consume_token(tokens, Tok::Greater)?;
+            consume_end_of_generics(tokens)?;
             Ok(Builtin::BorrowGlobal(
                 true,
                 StructName::parse(name)?,
                 type_actuals,
             ))
         }
-        Tok::GetTxnGasUnitPrice => {
-            tokens.advance()?;
-            Ok(Builtin::GetTxnGasUnitPrice)
-        }
-        Tok::GetTxnMaxGasUnits => {
-            tokens.advance()?;
-            Ok(Builtin::GetTxnMaxGasUnits)
-        }
-        Tok::GetTxnPublicKey => {
-            tokens.advance()?;
-            Ok(Builtin::GetTxnPublicKey)
-        }
         Tok::GetTxnSender => {
             tokens.advance()?;
             Ok(Builtin::GetTxnSender)
         }
-        Tok::GetTxnSequenceNumber => {
-            tokens.advance()?;
-            Ok(Builtin::GetTxnSequenceNumber)
-        }
         Tok::MoveFrom => {
             tokens.advance()?;
             let (name, type_actuals) = parse_name_and_type_actuals(tokens)?;
-            consume_token(tokens, Tok::Greater)?;
+            consume_end_of_generics(tokens)?;
             Ok(Builtin::MoveFrom(StructName::parse(name)?, type_actuals))
         }
         Tok::MoveToSender => {
             tokens.advance()?;
             let (name, type_actuals) = parse_name_and_type_actuals(tokens)?;
-            consume_token(tokens, Tok::Greater)?;
+            consume_end_of_generics(tokens)?;
             Ok(Builtin::MoveToSender(
                 StructName::parse(name)?,
                 type_actuals,
             ))
         }
-        Tok::GetGasRemaining => {
-            tokens.advance()?;
-            Ok(Builtin::GetGasRemaining)
-        }
         Tok::Freeze => {
             tokens.advance()?;
             Ok(Builtin::Freeze)
+        }
+        Tok::ToU8 => {
+            tokens.advance()?;
+            Ok(Builtin::ToU8)
+        }
+        Tok::ToU64 => {
+            tokens.advance()?;
+            Ok(Builtin::ToU64)
+        }
+        Tok::ToU128 => {
+            tokens.advance()?;
+            Ok(Builtin::ToU128)
         }
         _ => Err(ParseError::InvalidToken {
             location: tokens.start_loc(),
@@ -853,16 +897,14 @@ fn parse_cmd<'input>(tokens: &mut Lexer<'input>) -> Result<Cmd, ParseError<usize
         Tok::Exists
         | Tok::BorrowGlobal
         | Tok::BorrowGlobalMut
-        | Tok::GetTxnGasUnitPrice
-        | Tok::GetTxnMaxGasUnits
-        | Tok::GetTxnPublicKey
         | Tok::GetTxnSender
-        | Tok::GetTxnSequenceNumber
         | Tok::MoveFrom
         | Tok::MoveToSender
-        | Tok::GetGasRemaining
         | Tok::Freeze
-        | Tok::DotNameValue => Ok(Cmd::Exp(Box::new(parse_call_(tokens)?))),
+        | Tok::DotNameValue
+        | Tok::ToU8
+        | Tok::ToU64
+        | Tok::ToU128 => Ok(Cmd::Exp(Box::new(parse_call_(tokens)?))),
         Tok::LParen => {
             tokens.advance()?;
             let v = parse_comma_list(tokens, Tok::RParen, parse_exp_, true)?;
@@ -1102,9 +1144,17 @@ fn parse_type<'input>(
             tokens.advance()?;
             Type::Address
         }
+        Tok::U8 => {
+            tokens.advance()?;
+            Type::U8
+        }
         Tok::U64 => {
             tokens.advance()?;
             Type::U64
+        }
+        Tok::U128 => {
+            tokens.advance()?;
+            Type::U128
         }
         Tok::Bool => {
             tokens.advance()?;
@@ -1302,12 +1352,17 @@ fn parse_storage_location<'input>(
         Tok::AccountAddressValue => StorageLocation::Address(parse_account_address(tokens)?),
         Tok::Global => {
             tokens.advance()?; // this consumes 'global<' due to parser funkiness
-            let type_ = parse_struct_name(tokens)?;
+            let type_ = parse_qualified_struct_ident(tokens)?;
+            let type_actuals = parse_type_actuals(tokens)?;
             consume_token(tokens, Tok::Greater)?;
             consume_token(tokens, Tok::LParen)?;
             let address = Box::new(parse_storage_location(tokens)?);
             consume_token(tokens, Tok::RParen)?;
-            StorageLocation::GlobalResource { type_, address }
+            StorageLocation::GlobalResource {
+                type_,
+                type_actuals,
+                address,
+            }
         }
         Tok::Old => {
             tokens.advance()?;
@@ -1342,17 +1397,26 @@ fn parse_unary_spec_exp<'input>(
     tokens: &mut Lexer<'input>,
 ) -> Result<SpecExp, ParseError<usize, anyhow::Error>> {
     Ok(match tokens.peek() {
-        Tok::AccountAddressValue | Tok::True | Tok::False | Tok::U64Value | Tok::ByteArrayValue => {
-            SpecExp::Constant(parse_copyable_val_(tokens)?.value)
-        }
+        Tok::AccountAddressValue
+        | Tok::True
+        | Tok::False
+        | Tok::U8Value
+        | Tok::U64Value
+        | Tok::U128Value
+        | Tok::ByteArrayValue => SpecExp::Constant(parse_copyable_val_(tokens)?.value),
         Tok::GlobalExists => {
             tokens.advance()?; // this consumes 'global_exists<' due to parser funkiness
-            let type_ = parse_struct_name(tokens)?;
+            let type_ = parse_qualified_struct_ident(tokens)?;
+            let type_actuals = parse_type_actuals(tokens)?;
             consume_token(tokens, Tok::Greater)?;
             consume_token(tokens, Tok::LParen)?;
             let address = parse_storage_location(tokens)?;
             consume_token(tokens, Tok::RParen)?;
-            SpecExp::GlobalExists { type_, address }
+            SpecExp::GlobalExists {
+                type_,
+                type_actuals,
+                address,
+            }
         }
         Tok::Star => {
             tokens.advance()?;

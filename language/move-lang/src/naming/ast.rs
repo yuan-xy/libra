@@ -11,7 +11,7 @@ use crate::{
     shared::*,
 };
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt,
 };
 
@@ -31,7 +31,11 @@ pub struct Program {
 
 #[derive(Debug)]
 pub struct ModuleDefinition {
-    pub is_source_module: bool,
+    pub uses: BTreeMap<ModuleIdent, Loc>,
+    /// `None` if it is a library dependency
+    /// `Some(order)` if it is a source file. Where `order` is the topological order/rank in the
+    /// depedency graph. `order` is initialized at `0` and set in the uses pass
+    pub is_source_module: Option<usize>,
     pub structs: UniqueMap<StructName, StructDefinition>,
     pub functions: UniqueMap<FunctionName, Function>,
 }
@@ -191,7 +195,6 @@ pub enum BuiltinFunction_ {
      * GetPublicKey,
      * GetSender,
      * GetSequenceNumber,
-     * GetGasRemaining,
      * EmitEvent, */
 }
 pub type BuiltinFunction = Spanned<BuiltinFunction_>;
@@ -341,7 +344,6 @@ impl BuiltinFunction_ {
     // pub const GET_PUBLIC_KEY: &'static str = "get_public_key";
     // pub const GET_SENDER: &'static str = "get_sender";
     // pub const GET_SEQUENCE_NUMBER: &'static str = "get_sequence_number";
-    // pub const GET_GAS_REMAINING: &'static str = "get_gas_remaining";
     // pub const EMIT_EVENT: &'static str = "emit_event";
     pub fn all_names() -> BTreeSet<&'static str> {
         let mut s = BTreeSet::new();

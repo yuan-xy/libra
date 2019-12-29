@@ -2,43 +2,50 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::SynchronizerState;
-use anyhow::{format_err, Result};
+use anyhow::{ensure, format_err, Result};
 use executor::{ExecutedTrees, Executor};
-use futures::{Future, FutureExt};
 use grpcio::EnvBuilder;
 use libra_config::config::NodeConfig;
 use libra_types::{
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeEventWithProof},
+    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
     transaction::TransactionListWithProof,
 };
-use std::{pin::Pin, sync::Arc};
+use std::sync::Arc;
 use storage_client::{StorageRead, StorageReadServiceClient};
 use vm_runtime::LibraVM;
 
 /// Proxies interactions with execution and storage for state synchronization
+#[async_trait::async_trait]
 pub trait ExecutorProxyTrait: Sync + Send {
     /// Sync the local state with the latest in storage.
-    fn get_local_storage_state(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<SynchronizerState>> + Send>>;
+    async fn get_local_storage_state(&self) -> Result<SynchronizerState>;
 
     /// Execute and commit a batch of transactions
-    fn execute_chunk(
+    async fn execute_chunk(
         &self,
         txn_list_with_proof: TransactionListWithProof,
-        ledger_info_with_sigs: LedgerInfoWithSignatures,
+        verified_target_li: LedgerInfoWithSignatures,
+        intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
         synced_trees: &mut ExecutedTrees,
     ) -> Result<()>;
 
     /// Gets chunk of transactions given the known version, target version and the max limit.
-    fn get_chunk(
+    async fn get_chunk(
         &self,
         known_version: u64,
         limit: u64,
         target_version: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<TransactionListWithProof>> + Send>>;
+    ) -> Result<TransactionListWithProof>;
 
-    fn get_epoch_proof(&self, start_epoch: u64) -> Result<ValidatorChangeEventWithProof>;
+    /// Get the epoch change ledger info for [start_epoch, end_epoch) so that we can move to end_epoch.
+    async fn get_epoch_proof(
+        &self,
+        start_epoch: u64,
+        end_epoch: u64,
+    ) -> Result<ValidatorChangeProof>;
+
+    /// Tries to find a LedgerInfo for a given version.
+    async fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures>;
 }
 
 pub(crate) struct ExecutorProxy {
@@ -61,68 +68,83 @@ impl ExecutorProxy {
     }
 }
 
+#[async_trait::async_trait]
 impl ExecutorProxyTrait for ExecutorProxy {
-    fn get_local_storage_state(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<SynchronizerState>> + Send>> {
-        let client = Arc::clone(&self.storage_read_client);
-        async move {
-            let storage_info = client
-                .get_startup_info_async()
-                .await?
-                .ok_or_else(|| format_err!("[state sync] Failed to access storage info"))?;
-            let synced_trees = if let Some(synced_tree_state) = storage_info.synced_tree_state {
-                ExecutedTrees::from(synced_tree_state)
-            } else {
-                ExecutedTrees::from(storage_info.committed_tree_state)
-            };
-            let current_verifier = storage_info
-                .ledger_info_with_validators
-                .ledger_info()
-                .next_validator_set()
-                .expect("No ValidatorSet found for the start of the epoch")
-                .into();
-            Ok(SynchronizerState::new(
-                storage_info.ledger_info,
-                synced_trees,
-                current_verifier,
-            ))
-        }
-            .boxed()
+    async fn get_local_storage_state(&self) -> Result<SynchronizerState> {
+        let storage_info = self
+            .storage_read_client
+            .get_startup_info_async()
+            .await?
+            .ok_or_else(|| format_err!("[state sync] Failed to access storage info"))?;
+
+        let current_verifier = storage_info.get_validator_set().into();
+
+        let synced_trees = if let Some(synced_tree_state) = storage_info.synced_tree_state {
+            ExecutedTrees::from(synced_tree_state)
+        } else {
+            ExecutedTrees::from(storage_info.committed_tree_state)
+        };
+
+        Ok(SynchronizerState::new(
+            storage_info.latest_ledger_info,
+            synced_trees,
+            current_verifier,
+        ))
     }
 
-    fn execute_chunk(
+    async fn execute_chunk(
         &self,
         txn_list_with_proof: TransactionListWithProof,
-        ledger_info_with_sigs: LedgerInfoWithSignatures,
+        verified_target_li: LedgerInfoWithSignatures,
+        intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
         synced_trees: &mut ExecutedTrees,
     ) -> Result<()> {
         self.executor.execute_and_commit_chunk(
             txn_list_with_proof,
-            ledger_info_with_sigs,
+            verified_target_li,
+            intermediate_end_of_epoch_li,
             synced_trees,
         )
     }
 
-    fn get_chunk(
+    async fn get_chunk(
         &self,
         known_version: u64,
         limit: u64,
         target_version: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<TransactionListWithProof>> + Send>> {
-        let client = Arc::clone(&self.storage_read_client);
-        async move {
-            client
-                .get_transactions_async(known_version + 1, limit, target_version, false)
-                .await
-        }
-            .boxed()
+    ) -> Result<TransactionListWithProof> {
+        self.storage_read_client
+            .get_transactions_async(known_version + 1, limit, target_version, false)
+            .await
     }
 
-    fn get_epoch_proof(&self, start_epoch: u64) -> Result<ValidatorChangeEventWithProof> {
-        let ledger_info_per_epoch = self
+    async fn get_epoch_proof(
+        &self,
+        start_epoch: u64,
+        end_epoch: u64,
+    ) -> Result<ValidatorChangeProof> {
+        let validator_change_proof = self
             .storage_read_client
-            .get_epoch_change_ledger_infos(start_epoch)?;
-        Ok(ValidatorChangeEventWithProof::new(ledger_info_per_epoch))
+            .get_epoch_change_ledger_infos_async(start_epoch, end_epoch)
+            .await?;
+        Ok(validator_change_proof)
+    }
+
+    async fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+        let (_, _, li_chain, _) = self
+            .storage_read_client
+            .update_to_latest_ledger_async(version, vec![])
+            .await?;
+        let waypoint_li = li_chain
+            .ledger_info_with_sigs
+            .first()
+            .ok_or_else(|| format_err!("No waypoint found for version {}", version))?;
+        ensure!(
+            waypoint_li.ledger_info().version() == version,
+            "Version of Waypoint LI {} is different from requested waypoint version {}",
+            waypoint_li.ledger_info().version(),
+            version
+        );
+        Ok(waypoint_li.clone())
     }
 }

@@ -26,6 +26,7 @@ use storage_client::StorageRead;
 /// and supports clean up (i.e. tree pruning).
 /// Blocks persisted are proposed but not yet committed.  The committed state is persisted
 /// via StateComputer.
+#[async_trait::async_trait]
 pub trait PersistentStorage<T>: Send + Sync {
     /// Persist the blocks and quorum certs into storage atomically.
     fn save_tree(&self, blocks: Vec<Block<T>>, quorum_certs: Vec<QuorumCert>) -> Result<()>;
@@ -37,7 +38,7 @@ pub trait PersistentStorage<T>: Send + Sync {
     fn save_state(&self, vote: &Vote) -> Result<()>;
 
     /// Construct necessary data to start consensus.
-    fn start(&self) -> RecoveryData<T>;
+    async fn start(&self) -> RecoveryData<T>;
 
     /// Persist the highest timeout certificate for improved liveness - proof for other replicas
     /// to jump to this round
@@ -162,7 +163,7 @@ impl<T: Payload> RecoveryData<T> {
     }
 
     pub fn validator_keys(&self) -> Vec<ValidatorPublicKeys> {
-        self.validator_keys.payload().to_vec()
+        self.validator_keys.to_vec()
     }
 
     /// Finds the root (last committed block) and returns the root block, the QC to the root block
@@ -257,6 +258,7 @@ impl StorageWriteProxy {
     }
 }
 
+#[async_trait::async_trait]
 impl<T: Payload> PersistentStorage<T> for StorageWriteProxy {
     fn save_tree(&self, blocks: Vec<Block<T>>, quorum_certs: Vec<QuorumCert>) -> Result<()> {
         self.db
@@ -276,7 +278,7 @@ impl<T: Payload> PersistentStorage<T> for StorageWriteProxy {
         self.db.save_state(lcs::to_bytes(vote)?)
     }
 
-    fn start(&self) -> RecoveryData<T> {
+    async fn start(&self) -> RecoveryData<T> {
         info!("Start consensus recovery.");
         let raw_data = self
             .db
@@ -309,23 +311,20 @@ impl<T: Payload> PersistentStorage<T> for StorageWriteProxy {
         // find the block corresponding to storage latest ledger info
         let startup_info = self
             .read_client
-            .get_startup_info()
+            .get_startup_info_async()
+            .await
             .expect("unable to read ledger info from storage")
             .expect("startup info is None");
+        let validator_set = startup_info.get_validator_set().clone();
         let root_executed_trees = ExecutedTrees::from(startup_info.committed_tree_state);
         let mut initial_data = RecoveryData::new(
             last_vote,
             blocks,
             quorum_certs,
-            startup_info.ledger_info.ledger_info(),
+            startup_info.latest_ledger_info.ledger_info(),
             root_executed_trees,
             highest_timeout_certificate,
-            startup_info
-                .ledger_info_with_validators
-                .ledger_info()
-                .next_validator_set()
-                .expect("should have ValidatorSet when start new epoch")
-                .clone(),
+            validator_set,
         )
         .expect("Cannot construct recovery data");
 

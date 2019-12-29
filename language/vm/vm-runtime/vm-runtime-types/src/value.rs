@@ -17,7 +17,7 @@ use serde::{de, Deserialize, Serialize};
 use std::{
     cell::{Ref, RefCell},
     fmt,
-    mem::replace,
+    mem::{replace, size_of},
     ops::Add,
     rc::Rc,
 };
@@ -28,7 +28,6 @@ use vm::{
         words_in, AbstractMemorySize, GasAlgebra, GasCarrier, CONST_SIZE, REFERENCE_SIZE,
         STRUCT_SIZE,
     },
-    vm_string::VMString,
     IndexKind,
 };
 
@@ -56,11 +55,12 @@ enum ValueImpl {
     /// Locals are invalid on entry of a function and when moved out.
     Invalid,
     // Primitive types
+    U8(u8),
     U64(u64),
+    U128(u128),
     Address(AccountAddress),
     Bool(bool),
     ByteArray(ByteArray),
-    String(VMString),
 
     /// A struct in Move.
     Struct(Struct),
@@ -140,6 +140,14 @@ pub struct GlobalRef {
     reference: MutVal,
 }
 
+/// An integer value in Move.
+#[derive(Debug)]
+pub enum IntegerValue {
+    U8(u8),
+    U64(u64),
+    U128(u128),
+}
+
 // All implementation here is private to this module and the effective logic in
 // working with values in the VM.
 impl ValueImpl {
@@ -161,6 +169,8 @@ impl ValueImpl {
                 Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
             }
             ValueImpl::PromotedReference(reference) => reference.copy_value(),
+            ValueImpl::Struct(s) => s.copy_value(),
+            ValueImpl::NativeStruct(s) => s.copy_value(),
             _ => Ok(Value(self.clone())),
         }
     }
@@ -177,7 +187,11 @@ impl ValueImpl {
 
     fn size(&self) -> AbstractMemorySize<GasCarrier> {
         match self {
-            ValueImpl::Invalid | ValueImpl::U64(_) | ValueImpl::Bool(_) => *CONST_SIZE,
+            ValueImpl::Invalid
+            | ValueImpl::U8(_)
+            | ValueImpl::U64(_)
+            | ValueImpl::U128(_)
+            | ValueImpl::Bool(_) => *CONST_SIZE,
             ValueImpl::Address(_) => AbstractMemorySize::new(ADDRESS_LENGTH as u64),
             // Possible debate topic: Should we charge based upon the size of the string.
             // At this moment, we take the view that you should be charged as though you are
@@ -185,7 +199,6 @@ impl ValueImpl {
             // the semantics that we utilize currently, but this string may
             // need to be copied at some later time, so we need to charge based
             // upon the size of the memory that will possibly need to be accessed.
-            ValueImpl::String(s) => words_in(AbstractMemorySize::new(s.len() as u64)),
             ValueImpl::ByteArray(key) => AbstractMemorySize::new(key.len() as u64),
             ValueImpl::Struct(s) => s.size(),
             ValueImpl::NativeStruct(s) => s.size(),
@@ -201,11 +214,12 @@ impl ValueImpl {
             // TODO: this does not look right to me....
             (ValueImpl::Invalid, ValueImpl::Invalid) => Ok(true),
             // values
+            (ValueImpl::U8(u1), ValueImpl::U8(u2)) => Ok(u1 == u2),
             (ValueImpl::U64(u1), ValueImpl::U64(u2)) => Ok(u1 == u2),
+            (ValueImpl::U128(u1), ValueImpl::U128(u2)) => Ok(u1 == u2),
             (ValueImpl::Bool(b1), ValueImpl::Bool(b2)) => Ok(b1 == b2),
             (ValueImpl::Address(a1), ValueImpl::Address(a2)) => Ok(a1 == a2),
             (ValueImpl::ByteArray(ba1), ValueImpl::ByteArray(ba2)) => Ok(ba1 == ba2),
-            (ValueImpl::String(s1), ValueImpl::String(s2)) => Ok(s1 == s2),
             (ValueImpl::Struct(s1), ValueImpl::Struct(s2)) => s1.equals(s2),
             // references
             (ValueImpl::Reference(ref1), ValueImpl::Reference(ref2)) => ref1.equals(ref2),
@@ -227,11 +241,12 @@ impl ValueImpl {
     fn to_type_FOR_TESTING(&self) -> Type {
         match self {
             ValueImpl::Invalid => unreachable!("Cannot ask type of invalid location"),
+            ValueImpl::U8(_) => Type::U8,
             ValueImpl::U64(_) => Type::U64,
+            ValueImpl::U128(_) => Type::U128,
             ValueImpl::Address(_) => Type::Address,
             ValueImpl::Bool(_) => Type::Bool,
             ValueImpl::ByteArray(_) => Type::ByteArray,
-            ValueImpl::String(_) => Type::String,
             ValueImpl::Struct(s) => Type::Struct(s.to_struct_def_FOR_TESTING()),
             ValueImpl::NativeStruct(v) => Type::Struct(v.to_struct_def_FOR_TESTING()),
             ValueImpl::Reference(reference) => {
@@ -247,11 +262,12 @@ impl ValueImpl {
     fn pretty_string(&self) -> String {
         match self {
             ValueImpl::Invalid => "Invalid".to_string(),
+            ValueImpl::U8(i) => format!("U8({})", i),
             ValueImpl::U64(i) => format!("U64({})", i),
+            ValueImpl::U128(i) => format!("U128({})", i),
             ValueImpl::Address(addr) => format!("Address({})", addr.short_str()),
             ValueImpl::Bool(b) => format!("Bool({})", b),
             ValueImpl::ByteArray(ba) => format!("ByteArray({})", ba),
-            ValueImpl::String(s) => format!("String({})", s),
             ValueImpl::Struct(s) => format!("Struct({})", s.pretty_string()),
             ValueImpl::NativeStruct(v) => format!("NativeStruct({:?})", v),
             ValueImpl::Reference(reference) => format!("Reference({})", reference.pretty_string()),
@@ -269,9 +285,19 @@ impl Value {
         Value(value)
     }
 
+    /// Return a `Value` representing a `u8` in the VM.
+    pub fn u8(value: u8) -> Self {
+        Value(ValueImpl::U8(value))
+    }
+
     /// Return a `Value` representing a `u64` in the VM.
     pub fn u64(value: u64) -> Self {
         Value(ValueImpl::U64(value))
+    }
+
+    /// Return a `Value` representing a `u128` in the VM.
+    pub fn u128(value: u128) -> Self {
+        Value(ValueImpl::U128(value))
     }
 
     /// Return a `Value` representing an `AccountAddress` in the VM.
@@ -287,11 +313,6 @@ impl Value {
     /// Return a `Value` representing a `ByteArray` in the VM.
     pub fn byte_array(bytearray: ByteArray) -> Self {
         Value(ValueImpl::ByteArray(bytearray))
-    }
-
-    /// Return a `Value` representing a `String` in the VM.
-    pub fn string(s: VMString) -> Self {
-        Value(ValueImpl::String(s))
     }
 
     /// Return a `Value` representing a `Struct` in the VM.
@@ -369,9 +390,206 @@ impl Value {
             (SignatureToken::U64, ValueImpl::U64(_)) => true,
             (SignatureToken::Address, ValueImpl::Address(_)) => true,
             (SignatureToken::ByteArray, ValueImpl::ByteArray(_)) => true,
-            (SignatureToken::String, ValueImpl::String(_)) => true,
             _ => false,
         }
+    }
+}
+
+impl From<IntegerValue> for u8 {
+    fn from(value: IntegerValue) -> u8 {
+        use IntegerValue::*;
+        match value {
+            U8(x) => x as u8,
+            U64(x) => x as u8,
+            U128(x) => x as u8,
+        }
+    }
+}
+
+impl From<IntegerValue> for u64 {
+    fn from(value: IntegerValue) -> u64 {
+        use IntegerValue::*;
+        match value {
+            U8(x) => x as u64,
+            U64(x) => x as u64,
+            U128(x) => x as u64,
+        }
+    }
+}
+
+impl From<IntegerValue> for u128 {
+    fn from(value: IntegerValue) -> u128 {
+        use IntegerValue::*;
+        match value {
+            U8(x) => x as u128,
+            U64(x) => x as u128,
+            U128(x) => x as u128,
+        }
+    }
+}
+
+impl IntegerValue {
+    pub fn add_checked(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        let res = match (self, other) {
+            (U8(l), U8(r)) => u8::checked_add(l, r).map(IntegerValue::U8),
+            (U64(l), U64(r)) => u64::checked_add(l, r).map(IntegerValue::U64),
+            (U128(l), U128(r)) => u128::checked_add(l, r).map(IntegerValue::U128),
+            (l, r) => {
+                let msg = format!("Cannot add {:?} and {:?}", l, r);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        };
+        res.ok_or_else(|| VMStatus::new(StatusCode::ARITHMETIC_ERROR))
+    }
+
+    pub fn sub_checked(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        let res = match (self, other) {
+            (U8(l), U8(r)) => u8::checked_sub(l, r).map(IntegerValue::U8),
+            (U64(l), U64(r)) => u64::checked_sub(l, r).map(IntegerValue::U64),
+            (U128(l), U128(r)) => u128::checked_sub(l, r).map(IntegerValue::U128),
+            (l, r) => {
+                let msg = format!("Cannot sub {:?} from {:?}", r, l);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        };
+        res.ok_or_else(|| VMStatus::new(StatusCode::ARITHMETIC_ERROR))
+    }
+
+    pub fn mul_checked(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        let res = match (self, other) {
+            (U8(l), U8(r)) => u8::checked_mul(l, r).map(IntegerValue::U8),
+            (U64(l), U64(r)) => u64::checked_mul(l, r).map(IntegerValue::U64),
+            (U128(l), U128(r)) => u128::checked_mul(l, r).map(IntegerValue::U128),
+            (l, r) => {
+                let msg = format!("Cannot mul {:?} and {:?}", l, r);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        };
+        res.ok_or_else(|| VMStatus::new(StatusCode::ARITHMETIC_ERROR))
+    }
+
+    pub fn div_checked(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        let res = match (self, other) {
+            (U8(l), U8(r)) => u8::checked_div(l, r).map(IntegerValue::U8),
+            (U64(l), U64(r)) => u64::checked_div(l, r).map(IntegerValue::U64),
+            (U128(l), U128(r)) => u128::checked_div(l, r).map(IntegerValue::U128),
+            (l, r) => {
+                let msg = format!("Cannot div {:?} by {:?}", l, r);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        };
+        res.ok_or_else(|| VMStatus::new(StatusCode::ARITHMETIC_ERROR))
+    }
+
+    pub fn rem_checked(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        let res = match (self, other) {
+            (U8(l), U8(r)) => u8::checked_rem(l, r).map(IntegerValue::U8),
+            (U64(l), U64(r)) => u64::checked_rem(l, r).map(IntegerValue::U64),
+            (U128(l), U128(r)) => u128::checked_rem(l, r).map(IntegerValue::U128),
+            (l, r) => {
+                let msg = format!("Cannot rem {:?} by {:?}", l, r);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        };
+        res.ok_or_else(|| VMStatus::new(StatusCode::ARITHMETIC_ERROR))
+    }
+
+    pub fn bit_or(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        Ok(match (self, other) {
+            (U8(l), U8(r)) => IntegerValue::U8(l | r),
+            (U64(l), U64(r)) => IntegerValue::U64(l | r),
+            (U128(l), U128(r)) => IntegerValue::U128(l | r),
+            (l, r) => {
+                let msg = format!("Cannot bit_or {:?} and {:?}", l, r);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        })
+    }
+
+    pub fn bit_and(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        Ok(match (self, other) {
+            (U8(l), U8(r)) => IntegerValue::U8(l & r),
+            (U64(l), U64(r)) => IntegerValue::U64(l & r),
+            (U128(l), U128(r)) => IntegerValue::U128(l & r),
+            (l, r) => {
+                let msg = format!("Cannot bit_and {:?} and {:?}", l, r);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        })
+    }
+
+    pub fn bit_xor(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+        Ok(match (self, other) {
+            (U8(l), U8(r)) => IntegerValue::U8(l ^ r),
+            (U64(l), U64(r)) => IntegerValue::U64(l ^ r),
+            (U128(l), U128(r)) => IntegerValue::U128(l ^ r),
+            (l, r) => {
+                let msg = format!("Cannot bit_xor {:?} and {:?}", l, r);
+                return Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg));
+            }
+        })
+    }
+
+    pub const fn bits_of<T>() -> usize {
+        size_of::<T>() * 8
+    }
+
+    pub fn into_bits_shifted<T>(self) -> VMResult<usize> {
+        use IntegerValue::*;
+
+        let res = match self {
+            U8(x) => {
+                if x < (Self::bits_of::<T>() as u8) {
+                    Some(x as usize)
+                } else {
+                    None
+                }
+            }
+            U64(x) => {
+                if x < (Self::bits_of::<T>() as u64) {
+                    Some(x as usize)
+                } else {
+                    None
+                }
+            }
+            U128(x) => {
+                if x < (Self::bits_of::<T>() as u128) {
+                    Some(x as usize)
+                } else {
+                    None
+                }
+            }
+        };
+
+        res.ok_or_else(|| VMStatus::new(StatusCode::ARITHMETIC_ERROR))
+    }
+
+    pub fn shl_checked(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+
+        Ok(match self {
+            U8(x) => IntegerValue::U8(x << other.into_bits_shifted::<u8>()?),
+            U64(x) => IntegerValue::U64(x << other.into_bits_shifted::<u64>()?),
+            U128(x) => IntegerValue::U128(x << other.into_bits_shifted::<u128>()?),
+        })
+    }
+
+    pub fn shr_checked(self, other: Self) -> VMResult<Self> {
+        use IntegerValue::*;
+
+        Ok(match self {
+            U8(x) => IntegerValue::U8(x >> other.into_bits_shifted::<u8>()?),
+            U64(x) => IntegerValue::U64(x >> other.into_bits_shifted::<u64>()?),
+            U128(x) => IntegerValue::U128(x >> other.into_bits_shifted::<u128>()?),
+        })
     }
 }
 
@@ -381,12 +599,50 @@ impl Value {
 // (e.g. Add) the values popped from the stack are expected to be u64 and should fail otherwise.
 //
 
+impl From<Value> for VMResult<u8> {
+    fn from(value: Value) -> VMResult<u8> {
+        match value.0 {
+            ValueImpl::U8(i) => Ok(i),
+            _ => {
+                let msg = format!("Cannot cast {:?} to u8", value);
+                Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
+            }
+        }
+    }
+}
+
 impl From<Value> for VMResult<u64> {
     fn from(value: Value) -> VMResult<u64> {
         match value.0 {
             ValueImpl::U64(i) => Ok(i),
             _ => {
                 let msg = format!("Cannot cast {:?} to u64", value);
+                Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
+            }
+        }
+    }
+}
+
+impl From<Value> for VMResult<u128> {
+    fn from(value: Value) -> VMResult<u128> {
+        match value.0 {
+            ValueImpl::U128(i) => Ok(i),
+            _ => {
+                let msg = format!("Cannot cast {:?} to u128", value);
+                Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
+            }
+        }
+    }
+}
+
+impl From<Value> for VMResult<IntegerValue> {
+    fn from(value: Value) -> VMResult<IntegerValue> {
+        match value.0 {
+            ValueImpl::U8(i) => Ok(IntegerValue::U8(i)),
+            ValueImpl::U64(i) => Ok(IntegerValue::U64(i)),
+            ValueImpl::U128(i) => Ok(IntegerValue::U128(i)),
+            _ => {
+                let msg = format!("Cannot cast {:?} to integer", value);
                 Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
             }
         }
@@ -423,18 +679,6 @@ impl From<Value> for VMResult<ByteArray> {
             ValueImpl::ByteArray(byte_array) => Ok(byte_array),
             _ => {
                 let msg = format!("Cannot cast {:?} to ByteArray", value);
-                Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
-            }
-        }
-    }
-}
-
-impl From<Value> for VMResult<VMString> {
-    fn from(value: Value) -> VMResult<VMString> {
-        match value.0 {
-            ValueImpl::String(s) => Ok(s),
-            _ => {
-                let msg = format!("Cannot cast {:?} to String", value);
                 Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
             }
         }
@@ -518,7 +762,7 @@ impl MutVal {
         }
     }
 
-    fn copy_value(&self) -> VMResult<Value> {
+    pub(crate) fn copy_value(&self) -> VMResult<Value> {
         self.peek().copy_value()
     }
 
@@ -603,6 +847,14 @@ impl Struct {
             let msg = format!("Invalid field at index {} for {:?}", field_offset, self);
             Err(VMStatus::new(StatusCode::INTERNAL_TYPE_ERROR).with_message(msg))
         }
+    }
+
+    fn copy_value(&self) -> VMResult<Value> {
+        let mut values: Vec<Value> = vec![];
+        for value in &self.0 {
+            values.push(value.copy_value()?);
+        }
+        Ok(Value::struct_(Struct::new(values)))
     }
 
     // Invoked by gas metering to determine the size of the struct. (review)
@@ -884,8 +1136,7 @@ impl GlobalRef {
     }
 
     fn copy_value(&self) -> VMResult<Value> {
-        let value = self.reference.copy_value()?;
-        Ok(value)
+        self.reference.copy_value()
     }
 
     fn write_value(self, value: Value) {
@@ -1119,8 +1370,9 @@ impl<'de> de::DeserializeSeed<'de> for &Type {
 
         match self {
             Type::Bool => bool::deserialize(deserializer).map(Value::bool),
+            Type::U8 => u8::deserialize(deserializer).map(Value::u8),
             Type::U64 => u64::deserialize(deserializer).map(Value::u64),
-            Type::String => VMString::deserialize(deserializer).map(Value::string),
+            Type::U128 => u128::deserialize(deserializer).map(Value::u128),
             Type::ByteArray => ByteArray::deserialize(deserializer).map(Value::byte_array),
             Type::Address => AccountAddress::deserialize(deserializer).map(Value::address),
             Type::Struct(s_fields) => s_fields.deserialize(deserializer),
@@ -1196,11 +1448,6 @@ impl Serialize for ValueImpl {
                 addr.serialize(serializer)
             }
             ValueImpl::Bool(b) => serializer.serialize_bool(*b),
-            ValueImpl::String(s) => {
-                // TODO: must define an api for canonical serializations of string.
-                // Right now we are just using Rust to serialize the string
-                serializer.serialize_bytes(s.as_bytes())
-            }
             ValueImpl::Struct(vals) => {
                 let mut t = serializer.serialize_tuple(vals.0.len())?;
                 for mut_val in &vals.0 {

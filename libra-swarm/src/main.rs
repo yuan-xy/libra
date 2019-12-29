@@ -36,18 +36,9 @@ fn main() {
     let args = Args::from_args();
     let num_nodes = args.num_nodes;
     let num_full_nodes = args.num_full_nodes;
-    let (faucet_account_keypair, faucet_key_file_path, _temp_dir) =
-        generate_keypair::load_faucet_key_or_create_default(Some("faucet_key_for_test".to_string()));
-
-    println!(
-        "Faucet account created in (loaded from) file {:?}",
-        faucet_key_file_path
-    );
-
     let mut validator_swarm = LibraSwarm::configure_swarm(
         num_nodes,
         RoleType::Validator,
-        faucet_account_keypair.clone(),
         args.config_dir.clone(),
         None, /* template_path */
         None, /* upstream_config_dir */
@@ -59,7 +50,6 @@ fn main() {
             LibraSwarm::configure_swarm(
                 num_full_nodes,
                 RoleType::FullNode,
-                faucet_account_keypair,
                 None, /* config dir */
                 None, /* template_path */
                 Some(String::from(
@@ -85,19 +75,14 @@ fn main() {
             .expect("Failed to launch full node swarm");
     }
 
+    let faucet_key_file_path = &validator_swarm.config.faucet_key_path;
     let validator_config = NodeConfig::load(&validator_swarm.config.config_files[0]).unwrap();
-    let validator_set_file = validator_swarm
-        .dir
-        .as_ref()
-        .join("0")
-        .join(&validator_config.consensus.consensus_peers_file);
     println!("To run the Libra CLI client in a separate process and connect to the validator nodes you just spawned, use this command:");
     println!(
-        "\tcargo run --bin client -- -a localhost -p {} -s {:?} -m {:?}",
+        "\tcargo run --bin client -- -a localhost -p {} -m {:?}",
         validator_config
             .admission_control
             .admission_control_service_port,
-        validator_set_file,
         faucet_key_file_path,
     );
     let node_address_list = validator_swarm
@@ -122,11 +107,10 @@ fn main() {
         let full_node_config = NodeConfig::load(&swarm.config.config_files[0]).unwrap();
         println!("To connect to the full nodes you just spawned, use this command:");
         println!(
-            "\tcargo run --bin client -- -a localhost -p {} -s {:?} -m {:?}",
+            "\tcargo run --bin client -- -a localhost -p {} -m {:?}",
             full_node_config
                 .admission_control
                 .admission_control_service_port,
-            validator_set_file,
             faucet_key_file_path,
         );
     }
@@ -138,7 +122,6 @@ fn main() {
             validator_swarm.get_ac_port(0),
             Path::new(&faucet_key_file_path),
             &tmp_mnemonic_file.path(),
-            validator_set_file.into_os_string().into_string().unwrap(),
         );
         println!("Loading client...");
         let _output = client.output().expect("Failed to wait on child");

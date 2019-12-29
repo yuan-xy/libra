@@ -15,7 +15,6 @@ use vm::{
         MemberCount, ModuleHandle, SignatureToken, StructDefinition, StructDefinitionIndex,
         StructFieldInformation, StructHandleIndex, TableIndex,
     },
-    vm_string::VMString,
 };
 use vm_runtime::{code_cache::module_cache::ModuleCache, loaded_data::loaded_module::LoadedModule};
 use vm_runtime_types::value::*;
@@ -70,8 +69,16 @@ where
         ModuleId::new(address, name.into())
     }
 
-    fn next_int(&mut self) -> u64 {
+    fn next_u8(&mut self) -> u8 {
+        self.gen.gen_range(0, u8::max_value())
+    }
+
+    fn next_u64(&mut self) -> u64 {
         u64::from(self.gen.gen_range(0, u32::max_value()))
+    }
+
+    fn next_u128(&mut self) -> u128 {
+        u128::from(self.gen.gen_range(0, u32::max_value()))
     }
 
     fn next_bool(&mut self) -> bool {
@@ -83,15 +90,6 @@ where
         let len: usize = self.gen.gen_range(1, BYTE_ARRAY_MAX_SIZE);
         let bytes: Vec<u8> = (0..len).map(|_| self.gen.gen::<u8>()).collect();
         ByteArray::new(bytes)
-    }
-
-    fn next_str(&mut self) -> String {
-        let len: usize = self.gen.gen_range(1, MAX_STRING_SIZE);
-        random_string(&mut self.gen, len)
-    }
-
-    fn next_vm_string(&mut self) -> VMString {
-        self.next_str().into()
     }
 
     fn next_addr(&mut self) -> AccountAddress {
@@ -144,8 +142,9 @@ where
     pub fn inhabit(&mut self, sig_token: &SignatureToken) -> Value {
         match sig_token {
             SignatureToken::Bool => Value::bool(self.next_bool()),
-            SignatureToken::U64 => Value::u64(self.next_int()),
-            SignatureToken::String => Value::string(self.next_vm_string()),
+            SignatureToken::U8 => Value::u8(self.next_u8()),
+            SignatureToken::U64 => Value::u64(self.next_u64()),
+            SignatureToken::U128 => Value::u128(self.next_u128()),
             SignatureToken::Address => Value::address(self.next_addr()),
             SignatureToken::Reference(sig) | SignatureToken::MutableReference(sig) => {
                 let underlying_value = self.inhabit(&*sig);

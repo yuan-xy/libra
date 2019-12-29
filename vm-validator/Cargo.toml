@@ -11,8 +11,9 @@ edition = "2018"
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1"
+tokio = { version = "0.2", features = ["full"] }
 libra-config = { path = "../config", version = "0.1.0" }
-futures = "0.1.28"
 scratchpad = { path = "../storage/scratchpad", version = "0.1.0" }
 libra-state-view = { path = "../storage/state-view", version = "0.1.0" }
 storage-client = { path = "../storage/storage-client", version = "0.1.0" }

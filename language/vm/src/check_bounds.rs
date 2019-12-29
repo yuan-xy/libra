@@ -450,9 +450,6 @@ impl BoundsCheck<(&CompiledModuleMut, &FunctionSignature)> for CodeUnit {
                     LdByteArray(idx) => {
                         check_code_unit_bounds_impl(&module.byte_array_pool, bytecode_offset, *idx)
                     }
-                    LdStr(idx) => {
-                        check_code_unit_bounds_impl(&module.user_strings, bytecode_offset, *idx)
-                    }
                     MutBorrowField(idx) | ImmBorrowField(idx) => {
                         check_code_unit_bounds_impl(&module.field_defs, bytecode_offset, *idx)
                     }
@@ -518,9 +515,10 @@ impl BoundsCheck<(&CompiledModuleMut, &FunctionSignature)> for CodeUnit {
 
                     // List out the other options explicitly so there's a compile error if a new
                     // bytecode gets added.
-                    FreezeRef | Pop | Ret | LdConst(_) | LdTrue | LdFalse | ReadRef | WriteRef
-                    | Add | Sub | Mul | Mod | Div | BitOr | BitAnd | Xor | Or | And | Not | Eq
-                    | Neq | Lt | Gt | Le | Ge | Abort | GetTxnGasUnitPrice | GetTxnMaxGasUnits
+                    FreezeRef | Pop | Ret | LdU8(_) | LdU64(_) | LdU128(_) | CastU8 | CastU64
+                    | CastU128 | LdTrue | LdFalse | ReadRef | WriteRef | Add | Sub | Mul | Mod
+                    | Div | BitOr | BitAnd | Xor | Shl | Shr | Or | And | Not | Eq | Neq | Lt
+                    | Gt | Le | Ge | Abort | GetTxnGasUnitPrice | GetTxnMaxGasUnits
                     | GetGasRemaining | GetTxnSenderAddress | GetTxnSequenceNumber
                     | GetTxnPublicKey => vec![],
                 }

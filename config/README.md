@@ -22,11 +22,8 @@ Libra Configuration is broken up into many utilities:
   full node set
 - src/keys specifies means for storing and accessing keys from within
   configurations
-- config-builder extends src/generation with a command-line utility and
-  support for generating genesis
-- dynamic-config-builder is the next generation of config-builder that
-  supports deterministic generation of run-time usable configurations for
-bootstrapping (test) networks
+- config-builder extends src/generation with a Rust and command-line utility
+  and support for generating genesis
 - generate-keypair generates Ed25519 key pairs in LCS format
 
 The separation of the config-builder into its own crate was dicated by the
@@ -36,11 +33,10 @@ configuration from many of the services.
 
 ## Building a Test Network
 
-dynamic-config-builder builds a single nodes configuration within a network
-or swarm of nodes. This can be used to create a LIbra TestNet or to add a
-FullNetwork to an existing Network. In addition, it enables generation of a
-mint / faucet client capable of performing mint transactions / creating
-accounts.
+config-builder builds a single nodes configuration within a network or swarm of
+nodes. This can be used to create a LIbra TestNet or to add a FullNetwork to an
+existing Network. In addition, it enables generation of a mint / faucet client
+capable of performing mint transactions / creating accounts.
 
 ## Generating a new TestNet
 
@@ -66,7 +62,7 @@ As an example, this is the 2nd node (offset 1) in a set of 4:
     validator-config-builder \
         -a "/ip4/1.1.1.2/tcp/7000" \
         -b "/ip4/1.1.1.1/tcp/7000" \
-        -d /opt/libra/etc \
+        -d /opt/libra/data \
         -i 1 \
         -l "/ip4/0.0.0.0/tcp/7000" \
         -n 4 \
@@ -178,19 +174,15 @@ addresses, have dependecies outside the Libra code base. These tests serve as
 a reminder that there may be rammifications from breaking these that impact
 production deployments.
 
+The test configs currently live in `src/config/test_data`.
+
 ## TODO
 
 - Add ability to turn off services that are optional (debug interface, AC
   gRPC)
-- Eliminate BaseConfig, the data directory should be explicitly defined for
-  each path, configs that are relative should be using the path of the
-NodeConfig handed over during load / save. The Role can go directly into the
-root of NodeConfig
 - Eliminate ConsensusPeersConfig from ConsensusConfig and make it top level.
 - Is the execution gRPC interface being deprecated? Cleanup configs.
 - LoggerConfig should allow specifying the severity.
 - Eliminate generate-keypair
-- Move data to src/config/test\_data
-- Build distinct binaries in dynamic-config-builder for validator, full node,
-  and faucet nodes then delete config-builder
 - Generating public networks is broken
+- Make SafetyRule use on disk by default and remove from config generator

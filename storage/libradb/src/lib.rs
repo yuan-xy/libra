@@ -9,8 +9,8 @@
 //! It relays read/write operations on the physical storage via [`schemadb`] to the underlying
 //! Key-Value storage system, and implements libra data structures on top of it.
 
-// Used in other crates for testing.
-pub mod mock_genesis;
+#[macro_use]
+extern crate prometheus;
 // Used in this and other crates for testing.
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod test_helper;
@@ -42,9 +42,9 @@ use crate::{
     system_store::SystemStore,
     transaction_store::TransactionStore,
 };
-use anyhow::{bail, ensure, format_err, Result};
+use anyhow::{bail, ensure, Result};
 use itertools::{izip, zip_eq};
-use jellyfish_merkle::iterator::JellyfishMerkleIterator;
+use jellyfish_merkle::{iterator::JellyfishMerkleIterator, restore::JellyfishMerkleRestore};
 use lazy_static::lazy_static;
 use libra_crypto::hash::{CryptoHash, HashValue};
 use libra_logger::prelude::*;
@@ -55,17 +55,18 @@ use libra_types::{
     account_config::AccountResource,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::EventWithProof,
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeEventWithProof},
+    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
     get_with_proof::{RequestItem, ResponseItem},
     proof::{
         AccountStateProof, AccumulatorConsistencyProof, EventProof, SparseMerkleProof,
-        TransactionListProof, TransactionProof,
+        SparseMerkleRangeProof, TransactionListProof, TransactionProof,
     },
     transaction::{
         TransactionInfo, TransactionListWithProof, TransactionToCommit, TransactionWithProof,
         Version,
     },
 };
+use prometheus::{IntCounter, IntGauge, IntGaugeVec};
 use schemadb::{ColumnFamilyOptions, ColumnFamilyOptionsMap, DB, DEFAULT_CF_NAME};
 use std::{convert::TryInto, iter::Iterator, path::Path, sync::Arc, time::Instant};
 use storage_proto::StartupInfo;
@@ -75,8 +76,33 @@ lazy_static! {
     static ref OP_COUNTER: OpMetrics = OpMetrics::new_and_registered("storage");
 }
 
+lazy_static! {
+    pub static ref LIBRA_STORAGE_CF_SIZE_BYTES: IntGaugeVec = register_int_gauge_vec!(
+        // metric name
+        "libra_storage_cf_size_bytes",
+        // metric description
+        "Libra storage Column Family size in bytes",
+        // metric labels (dimensions)
+        &["cf_name"]
+    ).unwrap();
+
+    pub static ref LIBRA_STORAGE_COMMITTED_TXNS: IntCounter = register_int_counter!(
+        "libra_storage_committed_txns",
+        "Libra storage committed transactions"
+    ).unwrap();
+
+    pub static ref LIBRA_STORAGE_LATEST_TXN_VERSION: IntGauge = register_int_gauge!(
+        "libra_storage_latest_transaction_version",
+        "Libra storage latest transaction version"
+    ).unwrap();
+}
+
 const MAX_LIMIT: u64 = 1000;
 const MAX_REQUEST_ITEMS: u64 = 100;
+
+// TODO: Either implement an iteration API to allow a very old client to loop through a long history
+// or guarantee that there is always a recent enough waypoint and client knows to boot from there.
+const MAX_NUM_EPOCH_CHANGE_LEDGER_INFO: usize = 100;
 
 fn error_if_too_many_requested(num_requested: u64, max_allowed: u64) -> Result<()> {
     if num_requested > max_allowed {
@@ -303,13 +329,20 @@ impl LibraDB {
             .version())
     }
 
-    /// Returns ledger infos reflecting epoch bumps starting with the given epoch.
+    /// Returns ledger infos reflecting epoch bumps starting with the given epoch. If there are no
+    /// more than `MAX_NUM_EPOCH_CHANGE_LEDGER_INFO` results, this function returns all of them,
+    /// otherwise the first `MAX_NUM_EPOCH_CHANGE_LEDGER_INFO` results are returned and a flag
+    /// (when true) will be used to indicate the fact that there is more.
     pub fn get_epoch_change_ledger_infos(
         &self,
         start_epoch: u64,
-    ) -> Result<Vec<LedgerInfoWithSignatures>> {
-        self.ledger_store
-            .get_epoch_change_ledger_infos(start_epoch, self.get_latest_version()?)
+        end_epoch: u64,
+    ) -> Result<(Vec<LedgerInfoWithSignatures>, bool)> {
+        self.ledger_store.get_first_n_epoch_change_ledger_infos(
+            start_epoch,
+            end_epoch,
+            MAX_NUM_EPOCH_CHANGE_LEDGER_INFO,
+        )
     }
 
     /// Persist transactions. Called by the executor module when either syncing nodes or committing
@@ -376,7 +409,9 @@ impl LibraDB {
         if num_txns > 0 {
             let last_version = first_version + num_txns - 1;
             OP_COUNTER.inc_by("committed_txns", num_txns as usize);
+            LIBRA_STORAGE_COMMITTED_TXNS.inc_by(num_txns as i64);
             OP_COUNTER.set("latest_transaction_version", last_version as usize);
+            LIBRA_STORAGE_LATEST_TXN_VERSION.set(last_version as i64);
             counters
                 .expect("Counters should be bumped with transactions being saved.")
                 .bump_op_counters();
@@ -451,7 +486,7 @@ impl LibraDB {
     ) -> Result<(
         Vec<ResponseItem>,
         LedgerInfoWithSignatures,
-        ValidatorChangeEventWithProof,
+        ValidatorChangeProof,
         AccumulatorConsistencyProof,
     )> {
         error_if_too_many_requested(request_items.len() as u64, MAX_REQUEST_ITEMS)?;
@@ -461,8 +496,55 @@ impl LibraDB {
         let ledger_info = ledger_info_with_sigs.ledger_info();
         let ledger_version = ledger_info.version();
 
-        // Fulfill all request items
-        let response_items = request_items
+        // TODO: cache last epoch change version to avoid a DB access in most cases.
+        let client_epoch = self.ledger_store.get_epoch(client_known_version)?;
+        let validator_change_proof = if client_epoch < ledger_info.epoch() {
+            let (ledger_infos_with_sigs, more) = self.get_epoch_change_ledger_infos(
+                client_epoch,
+                self.ledger_store.get_epoch(ledger_info.version())?,
+            )?;
+            ValidatorChangeProof::new(ledger_infos_with_sigs, more)
+        } else {
+            ValidatorChangeProof::new(vec![], /* more = */ false)
+        };
+
+        let client_new_version = if !validator_change_proof.more {
+            ledger_version
+        } else {
+            validator_change_proof
+                .ledger_info_with_sigs
+                .last()
+                .expect("Must have at least one LedgerInfo.")
+                .ledger_info()
+                .version()
+        };
+        let ledger_consistency_proof = self
+            .ledger_store
+            .get_consistency_proof(client_known_version, client_new_version)?;
+
+        // If the validator change proof in the response is enough for the client to update to
+        // latest LedgerInfo, fulfill all request items. Otherwise the client will not be able to
+        // verify the latest LedgerInfo, so do not send response items back.
+        let response_items = if !validator_change_proof.more {
+            self.get_response_items(request_items, ledger_version)?
+        } else {
+            vec![]
+        };
+
+        Ok((
+            response_items,
+            ledger_info_with_sigs,
+            validator_change_proof,
+            ledger_consistency_proof,
+        ))
+    }
+
+    fn get_response_items(
+        &self,
+        request_items: Vec<RequestItem>,
+        ledger_version: Version,
+    ) -> Result<Vec<ResponseItem>> {
+        request_items
             .into_iter()
             .map(|request_item| match request_item {
                 RequestItem::GetAccountState { address } => Ok(ResponseItem::GetAccountState {
@@ -531,30 +613,16 @@ impl LibraDB {
                     })
                 }
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        // TODO: cache last epoch change version to avoid a DB access in most cases.
-        let client_epoch = self.ledger_store.get_epoch(client_known_version)?;
-        let validator_change_proof = if client_epoch < ledger_info.epoch() {
-            self.ledger_store
-                .get_epoch_change_ledger_infos(client_epoch, ledger_info.version())?
-        } else {
-            Vec::new()
-        };
-
-        let ledger_consistency_proof = self
-            .ledger_store
-            .get_consistency_proof(client_known_version, ledger_version)?;
-
-        Ok((
-            response_items,
-            ledger_info_with_sigs,
-            ValidatorChangeEventWithProof::new(validator_change_proof),
-            ledger_consistency_proof,
-        ))
+            .collect::<Result<Vec<_>>>()
     }
 
     // =========================== Libra Core Internal APIs ========================================
+
+    /// Gets the latest state root hash together with its version.
+    pub fn get_latest_state_root(&self) -> Result<(Version, HashValue)> {
+        let (version, txn_info) = self.ledger_store.get_latest_transaction_info()?;
+        Ok((version, txn_info.state_root_hash()))
+    }
 
     /// Gets an account state by account address, out of the ledger state indicated by the state
     /// Merkle tree root hash.
@@ -569,16 +637,31 @@ impl LibraDB {
             .get_account_state_with_proof_by_version(address, version)
     }
 
+    /// Given an account address, returns the latest account state. `None` if the account does not
+    /// exist.
+    pub fn get_latest_account_state(
+        &self,
+        address: AccountAddress,
+    ) -> Result<Option<AccountStateBlob>> {
+        let ledger_info_with_sigs = self.ledger_store.get_latest_ledger_info()?;
+        let version = ledger_info_with_sigs.ledger_info().version();
+        let (blob, _proof) = self
+            .state_store
+            .get_account_state_with_proof_by_version(address, version)?;
+        Ok(blob)
+    }
+
     /// Gets information needed from storage during the startup of the executor or state
     /// synchronizer module.
     ///
     /// This is used by the libra core (executor, state synchronizer) internally.
     pub fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
         // Get the latest ledger info. Return None if not bootstrapped.
-        let ledger_info_with_sigs = match self.ledger_store.get_latest_ledger_info_option() {
-            Some(x) => x,
-            None => return Ok(None),
-        };
+        let (latest_ledger_info, latest_validator_set) =
+            match self.ledger_store.get_startup_info()? {
+                Some(x) => x,
+                None => return Ok(None),
+            };
 
         let latest_tree_state = {
             let (latest_version, txn_info) = self.ledger_store.get_latest_transaction_info()?;
@@ -592,22 +675,9 @@ impl LibraDB {
                 account_state_root_hash,
             )
         };
-        let li_version = ledger_info_with_sigs.ledger_info().version();
-        assert!(latest_tree_state.version >= li_version);
-        let current_epoch = if ledger_info_with_sigs
-            .ledger_info()
-            .next_validator_set()
-            .is_some()
-        {
-            ledger_info_with_sigs.ledger_info().epoch() + 1
-        } else {
-            ledger_info_with_sigs.ledger_info().epoch()
-        };
-        let ledger_info_with_validators = self
-            .get_epoch_change_ledger_infos(current_epoch - 1)?
-            .pop()
-            .ok_or_else(|| format_err!("ledger info with validators not found"))?;
 
+        let li_version = latest_ledger_info.ledger_info().version();
+        assert!(latest_tree_state.version >= li_version);
         let startup_info = if latest_tree_state.version != li_version {
             // We synced to some version ahead of the version of the latest ledger info. Thus, we are still in sync mode.
             let committed_version = li_version;
@@ -616,24 +686,24 @@ impl LibraDB {
             let committed_ledger_frozen_subtree_hashes = self
                 .ledger_store
                 .get_ledger_frozen_subtree_hashes(committed_version)?;
-            StartupInfo {
-                ledger_info: ledger_info_with_sigs,
-                ledger_info_with_validators,
-                committed_tree_state: TreeState::new(
+            StartupInfo::new(
+                latest_ledger_info,
+                latest_validator_set,
+                TreeState::new(
                     committed_version,
                     committed_ledger_frozen_subtree_hashes,
                     committed_account_state_root_hash,
                 ),
-                synced_tree_state: Some(latest_tree_state),
-            }
+                Some(latest_tree_state),
+            )
         } else {
             // The version of the latest ledger info matches other data. So the storage is not in sync mode.
-            StartupInfo {
-                ledger_info: ledger_info_with_sigs,
-                ledger_info_with_validators,
-                committed_tree_state: latest_tree_state,
-                synced_tree_state: None,
-            }
+            StartupInfo::new(
+                latest_ledger_info,
+                latest_validator_set,
+                latest_tree_state,
+                None,
+            )
         };
 
         Ok(Some(startup_info))
@@ -704,6 +774,31 @@ impl LibraDB {
         Ok(Box::new(iterator))
     }
 
+    /// Gets the proof that proves a range of accounts.
+    pub fn get_account_state_range_proof(
+        &self,
+        rightmost_key: HashValue,
+        version: Version,
+    ) -> Result<SparseMerkleRangeProof> {
+        self.state_store
+            .get_account_state_range_proof(rightmost_key, version)
+    }
+
+    pub fn restore_account_state(
+        &self,
+        iter: impl Iterator<Item = (Vec<(HashValue, AccountStateBlob)>, SparseMerkleRangeProof)>,
+        version: Version,
+        expected_root_hash: HashValue,
+    ) -> Result<()> {
+        let mut restore =
+            JellyfishMerkleRestore::new(&*self.state_store, version, expected_root_hash)?;
+        for (chunk, proof) in iter {
+            restore.add_chunk(chunk, proof)?;
+        }
+        restore.finish()?;
+        Ok(())
+    }
+
     // ================================== Private APIs ==================================
     /// Convert a `ChangeSet` to `SealedChangeSet`.
     ///
@@ -740,6 +835,9 @@ impl LibraDB {
             Ok(cf_sizes) => {
                 for (cf_name, size) in cf_sizes {
                     OP_COUNTER.set(&format!("cf_size_bytes_{}", cf_name), size as usize);
+                    LIBRA_STORAGE_CF_SIZE_BYTES
+                        .with_label_values(&[&cf_name])
+                        .set(size as i64);
                 }
             }
             Err(err) => warn!(

@@ -18,7 +18,9 @@ use grpc_helpers::{provide_grpc_response, spawn_service_thread_with_drop_closure
 use libra_config::config::NodeConfig;
 use libra_logger::prelude::*;
 use libra_metrics::counters::SVC_COUNTERS;
-use libra_types::proto::types::{UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse};
+use libra_types::proto::types::{
+    UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse, ValidatorChangeProof,
+};
 use libradb::LibraDB;
 use std::{
     convert::TryFrom,
@@ -28,8 +30,10 @@ use std::{
 };
 use storage_proto::proto::storage::{
     create_storage, BackupAccountStateRequest, BackupAccountStateResponse,
+    GetAccountStateRangeProofRequest, GetAccountStateRangeProofResponse,
     GetAccountStateWithProofByVersionRequest, GetAccountStateWithProofByVersionResponse,
-    GetEpochChangeLedgerInfosRequest, GetEpochChangeLedgerInfosResponse, GetStartupInfoRequest,
+    GetEpochChangeLedgerInfosRequest, GetLatestAccountStateRequest, GetLatestAccountStateResponse,
+    GetLatestStateRootRequest, GetLatestStateRootResponse, GetStartupInfoRequest,
     GetStartupInfoResponse, GetTransactionsRequest, GetTransactionsResponse,
     SaveTransactionsRequest, SaveTransactionsResponse, Storage,
 };
@@ -149,7 +153,7 @@ impl StorageService {
         let (
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         ) = self
             .db
@@ -158,7 +162,7 @@ impl StorageService {
         let rust_resp = libra_types::get_with_proof::UpdateToLatestLedgerResponse {
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         };
 
@@ -180,6 +184,25 @@ impl StorageService {
 
         let rust_resp = storage_proto::GetTransactionsResponse::new(txn_list_with_proof);
 
+        Ok(rust_resp.into())
+    }
+
+    fn get_latest_state_root_inner(
+        &self,
+        _req: GetLatestStateRootRequest,
+    ) -> Result<GetLatestStateRootResponse> {
+        let (version, state_root_hash) = self.db.get_latest_state_root()?;
+        let rust_resp = storage_proto::GetLatestStateRootResponse::new(version, state_root_hash);
+        Ok(rust_resp.into())
+    }
+
+    fn get_latest_account_state_inner(
+        &self,
+        req: GetLatestAccountStateRequest,
+    ) -> Result<GetLatestAccountStateResponse> {
+        let rust_req = storage_proto::GetLatestAccountStateRequest::try_from(req)?;
+        let account_state_blob = self.db.get_latest_account_state(rust_req.address)?;
+        let rust_resp = storage_proto::GetLatestAccountStateResponse::new(account_state_blob);
         Ok(rust_resp.into())
     }
 
@@ -223,12 +246,25 @@ impl StorageService {
     fn get_epoch_change_ledger_infos_inner(
         &self,
         req: GetEpochChangeLedgerInfosRequest,
-    ) -> Result<GetEpochChangeLedgerInfosResponse> {
+    ) -> Result<ValidatorChangeProof> {
         let rust_req = storage_proto::GetEpochChangeLedgerInfosRequest::try_from(req)?;
-        let ledger_infos = self
+        let (ledger_infos, more) = self
             .db
-            .get_epoch_change_ledger_infos(rust_req.start_epoch)?;
-        let rust_resp = storage_proto::GetEpochChangeLedgerInfosResponse::new(ledger_infos);
+            .get_epoch_change_ledger_infos(rust_req.start_epoch, rust_req.end_epoch)?;
+        let rust_resp =
+            libra_types::validator_change::ValidatorChangeProof::new(ledger_infos, more);
+        Ok(rust_resp.into())
+    }
+
+    fn get_account_state_range_proof_inner(
+        &self,
+        req: GetAccountStateRangeProofRequest,
+    ) -> Result<GetAccountStateRangeProofResponse> {
+        let rust_req = storage_proto::GetAccountStateRangeProofRequest::try_from(req)?;
+        let proof = self
+            .db
+            .get_account_state_range_proof(rust_req.rightmost_key, rust_req.version)?;
+        let rust_resp = storage_proto::GetAccountStateRangeProofResponse::new(proof);
         Ok(rust_resp.into())
     }
 }
@@ -270,6 +306,30 @@ impl Storage for StorageService {
         provide_grpc_response(resp, ctx, sink);
     }
 
+    fn get_latest_state_root(
+        &mut self,
+        ctx: grpcio::RpcContext,
+        req: GetLatestStateRootRequest,
+        sink: grpcio::UnarySink<GetLatestStateRootResponse>,
+    ) {
+        debug!("[GRPC] Storage::get_latest_state_root");
+        let _timer = SVC_COUNTERS.req(&ctx);
+        let resp = self.get_latest_state_root_inner(req);
+        provide_grpc_response(resp, ctx, sink);
+    }
+
+    fn get_latest_account_state(
+        &mut self,
+        ctx: grpcio::RpcContext,
+        req: GetLatestAccountStateRequest,
+        sink: grpcio::UnarySink<GetLatestAccountStateResponse>,
+    ) {
+        debug!("[GRPC] Storage::get_latest_account_state");
+        let _timer = SVC_COUNTERS.req(&ctx);
+        let resp = self.get_latest_account_state_inner(req);
+        provide_grpc_response(resp, ctx, sink);
+    }
+
     fn get_account_state_with_proof_by_version(
         &mut self,
         ctx: grpcio::RpcContext,
@@ -298,7 +358,7 @@ impl Storage for StorageService {
         &mut self,
         ctx: grpcio::RpcContext,
         req: GetEpochChangeLedgerInfosRequest,
-        sink: grpcio::UnarySink<GetEpochChangeLedgerInfosResponse>,
+        sink: grpcio::UnarySink<ValidatorChangeProof>,
     ) {
         debug!("[GRPC] Storage::get_epoch_change_ledger_infos");
         let _timer = SVC_COUNTERS.req(&ctx);
@@ -345,6 +405,18 @@ impl Storage for StorageService {
             }
         }
         SVC_COUNTERS.resp(&ctx, success);
+    }
+
+    fn get_account_state_range_proof(
+        &mut self,
+        ctx: grpcio::RpcContext,
+        req: GetAccountStateRangeProofRequest,
+        sink: grpcio::UnarySink<GetAccountStateRangeProofResponse>,
+    ) {
+        debug!("[GRPC] Storage::get_account_state_range_proof");
+        let _timer = SVC_COUNTERS.req(&ctx);
+        let resp = self.get_account_state_range_proof_inner(req);
+        provide_grpc_response(resp, ctx, sink);
     }
 }
 

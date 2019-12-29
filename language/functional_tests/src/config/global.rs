@@ -117,7 +117,7 @@ impl Config {
 
         // generate a validator set with |validator_accounts| validators
         let (validator_keys, validator_set) = if validator_accounts > 0 {
-            let mut configs = generator::validator_swarm_for_testing(validator_accounts)?;
+            let mut configs = generator::validator_swarm_for_testing(validator_accounts);
             let consensus_peers = &configs[0].consensus.consensus_peers;
             let network_peers = &configs[0].validator_network.as_ref().unwrap().network_peers;
             let validator_set = consensus_peers.get_validator_set(&network_peers);
@@ -125,7 +125,6 @@ impl Config {
                 .iter_mut()
                 .map(|c| {
                     let peer_id = c.validator_network.as_ref().unwrap().peer_id;
-                    println!("{:?}", peer_id);
                     let account_keypair =
                         c.test.as_mut().unwrap().account_keypair.as_mut().unwrap();
                     let privkey = account_keypair.take_private().unwrap();

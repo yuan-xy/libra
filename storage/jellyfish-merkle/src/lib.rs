@@ -95,7 +95,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tree_cache::TreeCache;
 
 /// The hardcoded maximum height of a [`JellyfishMerkleTree`] in nibbles.
-const ROOT_NIBBLE_HEIGHT: usize = HashValue::LENGTH * 2;
+pub const ROOT_NIBBLE_HEIGHT: usize = HashValue::LENGTH * 2;
 
 /// `TreeReader` defines the interface between
 /// [`JellyfishMerkleTree`](struct.JellyfishMerkleTree.html)
@@ -597,7 +597,7 @@ where
         Ok(self.get_with_proof(key, version)?.0)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn get_root_hash(&self, version: Version) -> Result<HashValue> {
         let root_node_key = NodeKey::new_empty_path(version);
         let root_node = self.reader.get_node(&root_node_key)?;

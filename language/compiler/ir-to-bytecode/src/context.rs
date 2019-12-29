@@ -23,7 +23,6 @@ use vm::{
         ModuleHandleIndex, SignatureToken, StructDefinitionIndex, StructHandle, StructHandleIndex,
         TableIndex, TypeSignature, TypeSignatureIndex,
     },
-    vm_string::VMString,
 };
 
 type TypeFormalMap = HashMap<TypeVar, TableIndex>;
@@ -151,8 +150,6 @@ pub struct MaterializedPools {
     pub locals_signatures: Vec<LocalsSignature>,
     /// Identifier pool
     pub identifiers: Vec<Identifier>,
-    /// User string pool
-    pub user_strings: Vec<VMString>,
     /// Byte array pool
     pub byte_array_pool: Vec<ByteArray>,
     /// Address pool
@@ -277,8 +274,6 @@ impl<'a> Context<'a> {
             type_signatures: Self::materialize_map(self.type_signatures),
             locals_signatures: Self::materialize_map(self.locals_signatures),
             identifiers: Self::materialize_map(self.identifiers),
-            // TODO: implement support for user strings (string literals)
-            user_strings: vec![],
             byte_array_pool: Self::materialize_map(self.byte_array_pool),
             address_pool: Self::materialize_map(self.address_pool),
         };
@@ -585,8 +580,9 @@ impl<'a> Context<'a> {
     ) -> Result<SignatureToken> {
         Ok(match orig {
             x @ SignatureToken::Bool
+            | x @ SignatureToken::U8
             | x @ SignatureToken::U64
-            | x @ SignatureToken::String
+            | x @ SignatureToken::U128
             | x @ SignatureToken::ByteArray
             | x @ SignatureToken::Address
             | x @ SignatureToken::TypeParameter(_) => x,

@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::syntax::ParseError;
-use std::fmt;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tok {
     EOF,
     AccountAddressValue,
+    U8Value,
     U64Value,
+    U128Value,
     NameValue,
     NameBeginTyValue,
     DotNameValue,
@@ -31,10 +32,12 @@ pub enum Tok {
     Semicolon,
     Less,
     LessEqual,
+    LessLess,
     Equal,
     EqualEqual,
     Greater,
     GreaterEqual,
+    GreaterGreater,
     Caret,
     Underscore,
     /// Abort statement in the Move language
@@ -57,17 +60,15 @@ pub enum Tok {
     Exists,
     False,
     Freeze,
-    GetGasRemaining,
-    GetTxnGasUnitPrice,
-    GetTxnMaxGasUnits,
-    GetTxnPublicKey,
     /// Function to get transaction sender in the Move language
     GetTxnSender,
-    GetTxnSequenceNumber,
     /// Like borrow_global, but for spec language
     Global,
     /// Like exists, but for spec language
     GlobalExists,
+    ToU8,
+    ToU64,
+    ToU128,
     If,
     Import,
     Let,
@@ -90,7 +91,9 @@ pub enum Tok {
     True,
     /// Transaction sender in the specification language
     TxnSender,
+    U8,
     U64,
+    U128,
     Unrestricted,
     While,
     LBrace,
@@ -110,68 +113,65 @@ impl Tok {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Token<'input>(pub Tok, pub &'input str);
-
-impl<'a> fmt::Display for Token<'a> {
-    fn fmt<'f>(&self, formatter: &mut fmt::Formatter<'f>) -> Result<(), fmt::Error> {
-        fmt::Display::fmt(self.1, formatter)
-    }
-}
-
 pub struct Lexer<'input> {
     text: &'input str,
-    consumed: usize,
-    previous_end: usize,
-    token: (usize, Token<'input>, usize),
+    prev_end: usize,
+    cur_start: usize,
+    cur_end: usize,
+    token: Tok,
 }
 
 impl<'input> Lexer<'input> {
     pub fn new(s: &'input str) -> Lexer {
         Lexer {
             text: s,
-            consumed: 0,
-            previous_end: 0,
-            token: (0, Token(Tok::EOF, ""), 0),
+            prev_end: 0,
+            cur_start: 0,
+            cur_end: 0,
+            token: Tok::EOF,
         }
     }
 
     pub fn peek(&self) -> Tok {
-        (self.token.1).0
+        self.token
     }
 
     pub fn content(&self) -> &str {
-        (self.token.1).1
+        &self.text[self.cur_start..self.cur_end]
     }
 
     pub fn start_loc(&self) -> usize {
-        self.token.0
+        self.cur_start
     }
 
     pub fn previous_end_loc(&self) -> usize {
-        self.previous_end
+        self.prev_end
     }
 
     pub fn lookahead(&self) -> Result<Tok, ParseError<usize, anyhow::Error>> {
-        let text = self.text.trim_start();
-        let whitespace = self.text.len() - text.len();
-        let start_offset = self.consumed + whitespace;
-        let (tok, _) = find_token(text, start_offset)?;
+        let text = self.text[self.cur_end..].trim_start();
+        let offset = self.text.len() - text.len();
+        let (tok, _) = find_token(text, offset)?;
         Ok(tok)
     }
 
     pub fn advance(&mut self) -> Result<(), ParseError<usize, anyhow::Error>> {
-        self.previous_end = self.token.2;
-        let text = self.text.trim_start();
-        let whitespace = self.text.len() - text.len();
-        let start_offset = self.consumed + whitespace;
-        let (tok, len) = find_token(text, start_offset)?;
-        let result = &text[..len];
-        let remaining = &text[len..];
-        let end_offset = start_offset + len;
-        self.text = remaining;
-        self.consumed = end_offset;
-        self.token = (start_offset, Token(tok, result), end_offset);
+        self.prev_end = self.cur_end;
+        let text = self.text[self.cur_end..].trim_start();
+        self.cur_start = self.text.len() - text.len();
+        let (token, len) = find_token(text, self.cur_start)?;
+        self.cur_end = self.cur_start + len;
+        self.token = token;
+        Ok(())
+    }
+
+    pub fn replace_token(
+        &mut self,
+        token: Tok,
+        len: usize,
+    ) -> Result<(), ParseError<usize, anyhow::Error>> {
+        self.token = token;
+        self.cur_end = self.cur_start + len;
         Ok(())
     }
 }
@@ -198,7 +198,7 @@ fn find_token(
                     (Tok::AccountAddressValue, 2 + hex_len)
                 }
             } else {
-                (Tok::U64Value, get_decimal_digits_len(&text))
+                get_decimal_number(&text)
             }
         }
         'a'..='z' | 'A'..='Z' | '$' | '_' => {
@@ -282,6 +282,8 @@ fn find_token(
         '<' => {
             if text.starts_with("<=") {
                 (Tok::LessEqual, 2)
+            } else if text.starts_with("<<") {
+                (Tok::LessLess, 2)
             } else {
                 (Tok::Less, 1)
             }
@@ -289,6 +291,8 @@ fn find_token(
         '>' => {
             if text.starts_with(">=") {
                 (Tok::GreaterEqual, 2)
+            } else if text.starts_with(">>") {
+                (Tok::GreaterGreater, 2)
             } else {
                 (Tok::Greater, 1)
             }
@@ -332,14 +336,24 @@ fn get_name_len(text: &str) -> usize {
         .unwrap_or_else(|| text.len())
 }
 
-// Return the length of the substring containing characters in [0-9].
-fn get_decimal_digits_len(text: &str) -> usize {
-    text.chars()
+fn get_decimal_number(text: &str) -> (Tok, usize) {
+    let len = text
+        .chars()
         .position(|c| match c {
             '0'..='9' => false,
             _ => true,
         })
-        .unwrap_or_else(|| text.len())
+        .unwrap_or_else(|| text.len());
+    let rest = &text[len..];
+    if rest.starts_with("u8") {
+        (Tok::U8Value, len + 2)
+    } else if rest.starts_with("u64") {
+        (Tok::U64Value, len + 3)
+    } else if rest.starts_with("u128") {
+        (Tok::U128Value, len + 4)
+    } else {
+        (Tok::U64Value, len)
+    }
 }
 
 // Return the length of the substring containing characters in [0-9a-fA-F].
@@ -379,12 +393,10 @@ fn get_name_token(name: &str) -> Tok {
         "ensures" => Tok::Ensures,
         "false" => Tok::False,
         "freeze" => Tok::Freeze,
-        "get_gas_remaining" => Tok::GetGasRemaining,
-        "get_txn_gas_unit_price" => Tok::GetTxnGasUnitPrice,
-        "get_txn_max_gas_units" => Tok::GetTxnMaxGasUnits,
-        "get_txn_public_key" => Tok::GetTxnPublicKey,
         "get_txn_sender" => Tok::GetTxnSender,
-        "get_txn_sequence_number" => Tok::GetTxnSequenceNumber,
+        "to_u8" => Tok::ToU8,
+        "to_u64" => Tok::ToU64,
+        "to_u128" => Tok::ToU128,
         "if" => Tok::If,
         "import" => Tok::Import,
         "let" => Tok::Let,
@@ -401,7 +413,9 @@ fn get_name_token(name: &str) -> Tok {
         "succeeds_if" => Tok::SucceedsIf,
         "true" => Tok::True,
         "txn_sender" => Tok::TxnSender,
+        "u8" => Tok::U8,
         "u64" => Tok::U64,
+        "u128" => Tok::U128,
         "unrestricted" => Tok::Unrestricted,
         "while" => Tok::While,
         _ => Tok::NameValue,

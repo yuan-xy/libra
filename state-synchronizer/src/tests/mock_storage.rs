@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::SynchronizerState;
+use anyhow::{bail, Result};
 use executor::ExecutedTrees;
 use libra_crypto::hash::CryptoHash;
 use libra_crypto::HashValue;
 use libra_types::block_info::BlockInfo;
 use libra_types::crypto_proxies::ValidatorSet;
-use libra_types::crypto_proxies::{
-    ValidatorChangeEventWithProof, ValidatorSigner, ValidatorVerifier,
-};
+use libra_types::crypto_proxies::{ValidatorChangeProof, ValidatorSigner, ValidatorVerifier};
 use libra_types::{
     account_address::AccountAddress, crypto_proxies::LedgerInfoWithSignatures,
     ledger_info::LedgerInfo, test_helpers::transaction_test_helpers::get_test_signed_txn,
@@ -96,12 +95,12 @@ impl MockStorage {
         )
     }
 
-    pub fn get_epoch_changes(&self, known_epoch: u64) -> ValidatorChangeEventWithProof {
+    pub fn get_epoch_changes(&self, known_epoch: u64) -> ValidatorChangeProof {
         let mut epoch_change_lis = vec![];
         for epoch_num in known_epoch..self.epoch_num() {
             epoch_change_lis.push(self.ledger_infos.get(&epoch_num).unwrap().clone());
         }
-        ValidatorChangeEventWithProof::new(epoch_change_lis)
+        ValidatorChangeProof::new(epoch_change_lis, /* more = */ false)
     }
 
     pub fn get_chunk(
@@ -123,13 +122,24 @@ impl MockStorage {
     pub fn add_txns_with_li(
         &mut self,
         mut transactions: Vec<Transaction>,
-        li: LedgerInfoWithSignatures,
+        verified_target_li: LedgerInfoWithSignatures,
+        intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
     ) {
-        assert_eq!(self.epoch_num, li.ledger_info().epoch());
         self.add_txns(&mut transactions);
-        self.ledger_infos.insert(self.epoch_num(), li.clone());
-        if let Some(next_validator_set) = li.ledger_info().next_validator_set() {
-            self.epoch_num += 1;
+        if let Some(li) = intermediate_end_of_epoch_li {
+            self.epoch_num = li.ledger_info().epoch() + 1;
+            self.ledger_infos.insert(li.ledger_info().epoch(), li);
+            return;
+        }
+        if verified_target_li.ledger_info().epoch() != self.epoch_num() {
+            return;
+        }
+        self.ledger_infos.insert(
+            verified_target_li.ledger_info().epoch(),
+            verified_target_li.clone(),
+        );
+        if let Some(next_validator_set) = verified_target_li.ledger_info().next_validator_set() {
+            self.epoch_num = verified_target_li.ledger_info().epoch() + 1;
             self.verifier = next_validator_set.into();
         }
     }
@@ -194,5 +204,15 @@ impl MockStorage {
             .next_validator_set()
             .unwrap()
             .into();
+    }
+
+    // Find LedgerInfo for a given version.
+    pub fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+        for li in self.ledger_infos.values() {
+            if li.ledger_info().version() == version {
+                return Ok(li.clone());
+            }
+        }
+        bail!("No LedgerInfo found for version {}", version);
     }
 }

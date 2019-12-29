@@ -35,7 +35,7 @@ use libra_crypto::hash::TransactionAccumulatorHasher;
 use libra_logger::prelude::*;
 use libra_prost_ext::MessageExt;
 use libra_types::crypto_proxies::{
-    LedgerInfoWithSignatures, ValidatorChangeEventWithProof, ValidatorVerifier,
+    LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorVerifier,
 };
 use mirai_annotations::{
     debug_checked_precondition, debug_checked_precondition_eq, debug_checked_verify,
@@ -47,7 +47,7 @@ use crate::chained_bft::network::IncomingBlockRetrievalRequest;
 use consensus_types::block_retrieval::{BlockRetrievalResponse, BlockRetrievalStatus};
 #[cfg(test)]
 use safety_rules::ConsensusState;
-use safety_rules::SafetyRules;
+use safety_rules::TSafetyRules;
 use std::convert::TryInto;
 use std::time::Instant;
 use std::{sync::Arc, time::Duration};
@@ -71,8 +71,8 @@ pub struct EventProcessor<T> {
     pacemaker: Pacemaker,
     proposer_election: Box<dyn ProposerElection<T> + Send + Sync>,
     proposal_generator: ProposalGenerator<T>,
-    safety_rules: SafetyRules,
-    txn_manager: Arc<dyn TxnManager<Payload = T>>,
+    safety_rules: Box<dyn TSafetyRules<T> + Send + Sync>,
+    txn_manager: Box<dyn TxnManager<Payload = T>>,
     network: NetworkSender,
     storage: Arc<dyn PersistentStorage<T>>,
     time_service: Arc<dyn TimeService>,
@@ -88,8 +88,8 @@ impl<T: Payload> EventProcessor<T> {
         pacemaker: Pacemaker,
         proposer_election: Box<dyn ProposerElection<T> + Send + Sync>,
         proposal_generator: ProposalGenerator<T>,
-        safety_rules: SafetyRules,
-        txn_manager: Arc<dyn TxnManager<Payload = T>>,
+        safety_rules: Box<dyn TSafetyRules<T> + Send + Sync>,
+        txn_manager: Box<dyn TxnManager<Payload = T>>,
         network: NetworkSender,
         storage: Arc<dyn PersistentStorage<T>>,
         time_service: Arc<dyn TimeService>,
@@ -133,7 +133,7 @@ impl<T: Payload> EventProcessor<T> {
     /// Replica:
     ///
     /// Do nothing
-    async fn process_new_round_event(&self, new_round_event: NewRoundEvent) {
+    async fn process_new_round_event(&mut self, new_round_event: NewRoundEvent) {
         debug!("Processing {}", new_round_event);
         counters::CURRENT_ROUND.set(new_round_event.round as i64);
         counters::ROUND_TIMEOUT_MS.set(new_round_event.timeout.as_millis() as i64);
@@ -165,7 +165,7 @@ impl<T: Payload> EventProcessor<T> {
     }
 
     async fn generate_proposal(
-        &self,
+        &mut self,
         new_round_event: NewRoundEvent,
     ) -> anyhow::Result<ProposalMsg<T>> {
         // Proposal generator will ensure that at most one proposal is generated per round
@@ -373,7 +373,11 @@ impl<T: Payload> EventProcessor<T> {
             // The timeout event is late: the node has already moved to another round.
             return;
         }
-        let last_voted_round = self.safety_rules.consensus_state().last_voted_round();
+        let last_voted_round = self
+            .safety_rules
+            .consensus_state()
+            .unwrap()
+            .last_voted_round();
         warn!(
             "Round {} timed out: {}, expected round proposer was {:?}, broadcasting the vote to all replicas",
             round,
@@ -389,7 +393,7 @@ impl<T: Payload> EventProcessor<T> {
                 match backup_vote_res {
                     Ok(backup_vote) => backup_vote,
                     Err(e) => {
-                        error!("Failed to generate a backup vote: {}", e);
+                        error!("Failed to generate a backup vote: {:?}", e);
                         return;
                     }
                 }
@@ -441,7 +445,7 @@ impl<T: Payload> EventProcessor<T> {
         tc: Option<&TimeoutCertificate>,
     ) -> anyhow::Result<()> {
         self.safety_rules.update(qc)?;
-        let consensus_state = self.safety_rules.consensus_state();
+        let consensus_state = self.safety_rules.consensus_state()?;
         counters::PREFERRED_BLOCK_ROUND.set(consensus_state.preferred_round() as i64);
 
         let mut highest_committed_proposal_round = None;
@@ -518,13 +522,20 @@ impl<T: Payload> EventProcessor<T> {
         // Safety invariant: The last voted round is updated to be the same as the proposed block's
         // round. At this point, the replica has decided to vote for the proposed block.
         debug_checked_verify_eq!(
-            self.safety_rules.consensus_state().last_voted_round(),
+            self.safety_rules
+                .consensus_state()
+                .unwrap()
+                .last_voted_round(),
             proposal_round
         );
         // Safety invariant: qc_parent <-- qc
         // the preferred block round must be at least as large as qc_parent's round.
         debug_checked_verify!(
-            self.safety_rules.consensus_state().preferred_round() >= certified_parent_block_round
+            self.safety_rules
+                .consensus_state()
+                .unwrap()
+                .preferred_round()
+                >= certified_parent_block_round
         );
 
         let recipients = self
@@ -676,7 +687,7 @@ impl<T: Payload> EventProcessor<T> {
             .construct_and_sign_vote(&vote_proposal)
             .with_context(|| format!("{}Rejected{} {}", Fg(Red), Fg(Reset), block))?;
 
-        let consensus_state = self.safety_rules.consensus_state();
+        let consensus_state = self.safety_rules.consensus_state()?;
         counters::LAST_VOTE_ROUND.set(consensus_state.last_voted_round() as i64);
 
         self.storage
@@ -724,7 +735,7 @@ impl<T: Payload> EventProcessor<T> {
             };
         }
         if let Err(e) = self.add_vote(vote_msg.vote()).await {
-            error!("Error adding a new vote: {}", e);
+            error!("Error adding a new vote: {:?}", e);
         }
     }
 
@@ -785,7 +796,7 @@ impl<T: Payload> EventProcessor<T> {
         let blocks_to_commit = match self.block_store.commit(finality_proof.clone()).await {
             Ok(blocks) => blocks,
             Err(e) => {
-                error!("{}", e);
+                error!("{:?}", e);
                 return;
             }
         };
@@ -811,7 +822,10 @@ impl<T: Payload> EventProcessor<T> {
         }
         if finality_proof.ledger_info().next_validator_set().is_some() {
             self.network
-                .broadcast_epoch_change(ValidatorChangeEventWithProof::new(vec![finality_proof]))
+                .broadcast_epoch_change(ValidatorChangeProof::new(
+                    vec![finality_proof],
+                    /* more = */ false,
+                ))
                 .await
         }
     }
@@ -880,8 +894,8 @@ impl<T: Payload> EventProcessor<T> {
 
     /// Inspect the current consensus state.
     #[cfg(test)]
-    pub fn consensus_state(&self) -> ConsensusState {
-        self.safety_rules.consensus_state()
+    pub fn consensus_state(&mut self) -> ConsensusState {
+        self.safety_rules.consensus_state().unwrap()
     }
 
     pub fn block_store(&self) -> Arc<BlockStore<T>> {

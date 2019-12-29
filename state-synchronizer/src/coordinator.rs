@@ -1,13 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::chunk_request::{GetChunkRequest, TargetType};
+use crate::chunk_response::{GetChunkResponse, ResponseLedgerInfo};
 use crate::{
     counters,
     executor_proxy::ExecutorProxyTrait,
     peer_manager::{PeerManager, PeerScoreUpdateType},
     PeerId, SynchronizerState,
 };
-use anyhow::{bail, format_err, Result};
+use anyhow::{bail, ensure, format_err, Result};
 use futures::{
     channel::{mpsc, oneshot},
     stream::{futures_unordered::FuturesUnordered, select_all},
@@ -16,12 +18,14 @@ use futures::{
 use libra_config::config::RoleType;
 use libra_config::config::StateSyncConfig;
 use libra_logger::prelude::*;
-use libra_types::crypto_proxies::ValidatorChangeEventWithProof;
+use libra_types::crypto_proxies::ValidatorChangeProof;
+use libra_types::transaction::Version;
 use libra_types::{
     crypto_proxies::LedgerInfoWithSignatures, transaction::TransactionListWithProof,
+    waypoint::Waypoint,
 };
 use network::{
-    proto::{GetChunkRequest, GetChunkResponse, StateSynchronizerMsg, StateSynchronizerMsg_oneof},
+    proto::{StateSynchronizerMsg, StateSynchronizerMsg_oneof},
     validator_network::{Event, StateSynchronizerEvents, StateSynchronizerSender},
 };
 use std::{
@@ -40,7 +44,8 @@ pub(crate) struct SyncRequest {
 
 pub(crate) struct EpochRetrievalRequest {
     pub start_epoch: u64,
-    pub callback: oneshot::Sender<Result<ValidatorChangeEventWithProof>>,
+    pub end_epoch: u64,
+    pub callback: oneshot::Sender<Result<ValidatorChangeProof>>,
 }
 
 /// message used by StateSyncClient for communication with Coordinator
@@ -52,6 +57,8 @@ pub(crate) enum CoordinatorMessage {
     GetState(oneshot::Sender<SynchronizerState>),
     // used to generate epoch proof
     GetEpochProof(EpochRetrievalRequest),
+    // Receive a notification via a given channel when coordinator is initialized.
+    WaitInitialize(oneshot::Sender<Result<()>>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,10 +90,16 @@ pub(crate) struct SyncCoordinator<T> {
     config: StateSyncConfig,
     // role of node
     role: RoleType,
+    // An initial waypoint: for as long as the local version is less than a version determined by
+    // waypoint a node is not going to be abl
+    waypoint: Option<Waypoint>,
     // peers used for synchronization
     peer_manager: PeerManager,
     // Optional sync request to be called when the target sync is reached
     sync_request: Option<SyncRequest>,
+    // Option initialization listener to be called when the coordinator is caught up with
+    // its waypoint.
+    initialization_listener: Option<oneshot::Sender<Result<()>>>,
     // queue of incoming long polling requests
     // peer will be notified about new chunk of transactions if it's available before expiry time
     subscriptions: HashMap<PeerId, PendingRequestInfo>,
@@ -97,6 +110,7 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
     pub fn new(
         client_events: mpsc::UnboundedReceiver<CoordinatorMessage>,
         role: RoleType,
+        waypoint: Option<Waypoint>,
         config: StateSyncConfig,
         executor_proxy: T,
         initial_state: SynchronizerState,
@@ -113,9 +127,11 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
             retry_timeout: Duration::from_millis(retry_timeout_val),
             config,
             role,
+            waypoint,
             peer_manager: PeerManager::new(upstream_peers),
             subscriptions: HashMap::new(),
             sync_request: None,
+            initialization_listener: None,
             executor_proxy,
         }
     }
@@ -153,6 +169,9 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
                         CoordinatorMessage::GetEpochProof(request) => {
                             self.get_epoch_proof(request).await;
                         }
+                        CoordinatorMessage::WaitInitialize(cb_sender) => {
+                            self.set_initialization_listener(cb_sender);
+                        }
                     };
                 },
                 (idx, network_event) = network_events.select_next_some() => {
@@ -170,18 +189,33 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
                                 }
                                 Event::Message((peer_id, mut message)) => {
                                     match message.message.unwrap() {
-                                        StateSynchronizerMsg_oneof::ChunkRequest(request) => {
-                                            if let Err(err) = self.process_chunk_request(peer_id, request).await {
-                                                error!("[state sync] failed to serve chunk request from {}, local LI version {}: {}", peer_id, self.local_state.highest_local_li.ledger_info().version(), err);
+                                        StateSynchronizerMsg_oneof::ChunkRequest(request_msg) => {
+                                            match request_msg.try_into() {
+                                                Ok(request) => {
+                                                    if let Err(err) = self.process_chunk_request(peer_id, request).await {
+                                                        error!("[state sync] failed to serve chunk request from {}, local LI version {}: {}", peer_id, self.local_state.highest_local_li.ledger_info().version(), err);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("[state sync] failed to parse request_msg: {}", e);
+                                                }
                                             }
                                         }
-                                        StateSynchronizerMsg_oneof::ChunkResponse(response) => {
-                                            if let Err(err) = self.process_chunk_response(&peer_id, response).await {
-                                                error!("[state sync] failed to process chunk response from {}: {}", peer_id, err);
-                                                counters::APPLY_CHUNK_FAILURE.with_label_values(&[&*peer_id.to_string()]).inc();
-                                            } else {
-                                                self.peer_manager.update_score(&peer_id, PeerScoreUpdateType::Success);
-                                                counters::APPLY_CHUNK_SUCCESS.with_label_values(&[&*peer_id.to_string()]).inc();
+                                        StateSynchronizerMsg_oneof::ChunkResponse(response_msg) => {
+                                            match response_msg.try_into() {
+                                                Ok(response) => {
+                                                    if let Err(err) = self.process_chunk_response(&peer_id, response).await {
+                                                        error!("[state sync] failed to process chunk response from {}: {}", peer_id, err);
+                                                        counters::APPLY_CHUNK_FAILURE.with_label_values(&[&*peer_id.to_string()]).inc();
+                                                    } else {
+                                                        self.peer_manager.update_score(&peer_id, PeerScoreUpdateType::Success);
+                                                        counters::APPLY_CHUNK_SUCCESS.with_label_values(&[&*peer_id.to_string()]).inc();
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("[state sync] failed to parse response_msg: {}", e);
+                                                    counters::APPLY_CHUNK_FAILURE.with_label_values(&[&*peer_id.to_string()]).inc();
+                                                }
                                             }
                                         }
                                     }
@@ -213,6 +247,23 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
         Ok(())
     }
 
+    /// In case waypoint is set verify that the local LI has reached the waypoint version.
+    fn is_initialized(&self) -> bool {
+        self.waypoint.as_ref().map_or(true, |w| {
+            w.version() <= self.local_state.highest_local_li.ledger_info().version()
+        })
+    }
+
+    fn set_initialization_listener(&mut self, cb_sender: oneshot::Sender<Result<()>>) {
+        if self.is_initialized() {
+            if cb_sender.send(Ok(())).is_err() {
+                error!("Error sending initialization notification");
+            }
+        } else {
+            self.initialization_listener = Some(cb_sender);
+        }
+    }
+
     /// In case there has been another pending request it's going to be overridden.
     /// The caller will be notified about request completion via request.callback oneshot:
     /// at that moment it's guaranteed that the highest LI exposed by the storage is equal to the
@@ -221,25 +272,35 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
     /// trying to commit transactions concurrently).
     async fn request_sync(&mut self, request: SyncRequest) -> Result<()> {
         self.sync_state_with_local_storage().await?;
+        ensure!(
+            self.is_initialized(),
+            "[state sync] Sync request but initialization is not complete!"
+        );
         let highest_local_li = self.local_state.highest_local_li.ledger_info();
         let target_version = request.target.ledger_info().version();
-        counters::TARGET_VERSION.set(target_version as i64);
-        debug!(
-            "[state sync] sync requested. Known LI: {}, requested_version: {}",
-            highest_local_li, target_version
-        );
-
-        if target_version <= highest_local_li.version() {
-            warn!(
-                "[state sync] Sync request for version {} <= known version {}",
-                target_version,
-                highest_local_li.version()
-            );
+        if target_version == highest_local_li.version() {
             return request
                 .callback
                 .send(Ok(()))
                 .map_err(|_| format_err!("Callback error"));
         }
+
+        if target_version < highest_local_li.version() {
+            request
+                .callback
+                .send(Err(format_err!("Sync request to old version")))
+                .map_err(|_| format_err!("Callback error"))?;
+            bail!(
+                "[state sync] Sync request for version {} < known version {}",
+                target_version,
+                highest_local_li.version()
+            );
+        }
+        counters::TARGET_VERSION.set(target_version as i64);
+        debug!(
+            "[state sync] sync requested. Known LI: {}, requested_version: {}",
+            highest_local_li, target_version
+        );
 
         self.peer_manager
             .set_peers(request.target.signatures().keys().copied().collect());
@@ -284,6 +345,22 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
                     .map_err(|_| format_err!("Callback error"))?;
             }
         }
+
+        let initialization_complete = self
+            .initialization_listener
+            .as_ref()
+            .map_or(false, |_| self.is_initialized());
+        if initialization_complete {
+            debug!(
+                "[state sync] Finished initialization to waypoint. Current version: {}",
+                self.local_state.highest_local_li.ledger_info().version()
+            );
+            if let Some(listener) = self.initialization_listener.take() {
+                listener
+                    .send(Ok(()))
+                    .map_err(|_| format_err!("Error sending initialization notification"))?;
+            }
+        }
         Ok(())
     }
 
@@ -299,63 +376,167 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
     async fn process_chunk_request(
         &mut self,
         peer_id: PeerId,
-        mut request: GetChunkRequest,
+        request: GetChunkRequest,
     ) -> Result<()> {
-        if request.timeout > self.config.max_timeout_ms
-            || request.limit > self.config.max_chunk_limit
-        {
-            bail!(
-                "[state sync] Request timeout: {}, chunk limit: {}; configured max timeout is {} ms, and chunk limit is {}",
-                request.timeout,
-                request.limit,
-                self.config.max_timeout_ms,
-                self.config.max_chunk_limit
-            );
-        }
-        let target = request
-            .ledger_info_with_sigs
-            .take()
-            .map(TryInto::try_into)
-            .transpose()?;
         self.sync_state_with_local_storage().await?;
-        let local_li_version = self.local_state.highest_local_li.ledger_info().version();
         debug!(
-            "[state sync] chunk request: peer_id: {}, request known version: {}, target version: {}, local li version: {}",
+            "[state sync] chunk request: peer_id: {}, local li version: {}, req: {}",
             peer_id.short_str(),
-            request.known_version,
-            target.as_ref().map_or("None".to_string(), |t: &LedgerInfoWithSignatures| t.ledger_info().version().to_string()),
-            local_li_version,
+            self.local_state.highest_local_li.ledger_info().version(),
+            request,
         );
 
+        let sender = self
+            .peer_manager
+            .get_network_sender(&peer_id)
+            .ok_or_else(|| format_err!("ChunkRequest from unknown peer {}", peer_id.short_str()))?;
+        match request.target().clone() {
+            TargetType::TargetLedgerInfo(li) => {
+                self.process_request_target_li(sender, peer_id, request, li)
+                    .await
+            }
+            TargetType::HighestAvailable { timeout_ms } => {
+                self.process_request_highest_available(sender, peer_id, request, timeout_ms)
+                    .await
+            }
+            TargetType::Waypoint(waypoint_version) => {
+                self.process_request_waypoint(sender, peer_id, request, waypoint_version)
+                    .await
+            }
+        }
+    }
+
+    /// Processing requests with a specified target LedgerInfo.
+    /// Assumes that the local state is uptodate with storage.
+    async fn process_request_target_li(
+        &self,
+        sender: StateSynchronizerSender,
+        peer_id: PeerId,
+        request: GetChunkRequest,
+        target_li: LedgerInfoWithSignatures,
+    ) -> Result<()> {
+        let limit = std::cmp::min(request.limit, self.config.max_chunk_limit);
+        let response_li = self
+            .choose_response_li(
+                request.known_version,
+                request.current_epoch,
+                Some(target_li),
+            )
+            .await?;
+        // In case known_version is lower than the requested ledger info an empty response might be
+        // sent.
+        self.deliver_chunk(
+            peer_id,
+            request.known_version,
+            ResponseLedgerInfo::VerifiableLedgerInfo(response_li),
+            limit,
+            sender,
+        )
+        .await
+    }
+
+    /// Processing requests with no target LedgerInfo (highest available) and potentially long
+    /// polling.
+    /// Assumes that the local state is uptodate with storage.
+    async fn process_request_highest_available(
+        &mut self,
+        sender: StateSynchronizerSender,
+        peer_id: PeerId,
+        request: GetChunkRequest,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        let limit = std::cmp::min(request.limit, self.config.max_chunk_limit);
+        let timeout = std::cmp::min(timeout_ms, self.config.max_timeout_ms);
+
+        let response_li = self
+            .choose_response_li(request.known_version, request.current_epoch, None)
+            .await?;
         // If there is nothing a node can help with, and the request supports long polling,
         // add it to the subscriptions.
-        if local_li_version <= request.known_version && request.timeout > 0 {
-            let expiration_time =
-                SystemTime::now().checked_add(Duration::from_millis(request.timeout));
+        if self.local_state.highest_local_li.ledger_info().version() <= request.known_version
+            && timeout > 0
+        {
+            let expiration_time = SystemTime::now().checked_add(Duration::from_millis(timeout));
             if let Some(time) = expiration_time {
                 let request_info = PendingRequestInfo {
                     expiration_time: time,
                     known_version: request.known_version,
                     request_epoch: request.current_epoch,
-                    limit: request.limit,
+                    limit,
                 };
                 self.subscriptions.insert(peer_id, request_info);
             }
             return Ok(());
         }
 
-        // Send the chunk response right away (even if empty: empty response is better than no
-        // response at all because it triggers another attempt without timing out).
-        let sender = self
-            .peer_manager
-            .get_network_sender(&peer_id)
-            .ok_or_else(|| format_err!("ChunkRequest from unknown peer {}", peer_id.short_str()))?;
         self.deliver_chunk(
             peer_id,
             request.known_version,
-            request.current_epoch,
-            request.limit,
-            target,
+            ResponseLedgerInfo::VerifiableLedgerInfo(response_li),
+            limit,
+            sender,
+        )
+        .await
+    }
+
+    async fn process_request_waypoint(
+        &self,
+        sender: StateSynchronizerSender,
+        peer_id: PeerId,
+        request: GetChunkRequest,
+        waypoint_version: Version,
+    ) -> Result<()> {
+        let mut limit = std::cmp::min(request.limit, self.config.max_chunk_limit);
+        ensure!(
+            self.local_state.highest_local_li.ledger_info().version() >= waypoint_version,
+            "Local version {} < requested waypoint version {}.",
+            self.local_state.highest_local_li.ledger_info().version(),
+            waypoint_version
+        );
+        ensure!(
+            request.known_version < waypoint_version,
+            "Waypoint request version {} is not smaller than waypoint {}",
+            request.known_version,
+            waypoint_version
+        );
+
+        // Retrieve the waypoint LI.
+        let waypoint_li = self
+            .executor_proxy
+            .get_ledger_info(waypoint_version)
+            .await?;
+
+        // Txns are up to the end of request epoch with the proofs relative to the waypoint LI.
+        let end_of_epoch_li = if waypoint_li.ledger_info().epoch() > request.current_epoch {
+            Some(
+                self.executor_proxy
+                    .get_epoch_proof(request.current_epoch, request.current_epoch + 1)
+                    .await?
+                    .ledger_info_with_sigs
+                    .first()
+                    .ok_or_else(|| {
+                        format_err!(
+                            "No end of epoch LedgerInfo found for epoch {}",
+                            request.current_epoch
+                        )
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        if let Some(li) = end_of_epoch_li.as_ref() {
+            let num_txns_until_end_of_epoch = li.ledger_info().version() - request.known_version;
+            limit = std::cmp::min(limit, num_txns_until_end_of_epoch);
+        }
+        self.deliver_chunk(
+            peer_id,
+            request.known_version,
+            ResponseLedgerInfo::LedgerInfoForWaypoint {
+                waypoint_li,
+                end_of_epoch_li,
+            },
+            limit,
             sender,
         )
         .await
@@ -369,23 +550,19 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
         &self,
         peer_id: PeerId,
         known_version: u64,
-        request_epoch: u64,
+        response_li: ResponseLedgerInfo,
         limit: u64,
-        target: Option<LedgerInfoWithSignatures>,
         mut network_sender: StateSynchronizerSender,
     ) -> Result<()> {
-        let response_li = self.choose_response_li(known_version, request_epoch, target)?;
-
         let txns = self
             .executor_proxy
-            .get_chunk(known_version, limit, response_li.ledger_info().version())
+            .get_chunk(known_version, limit, response_li.version())
             .await?;
-        let chunk_response = GetChunkResponse {
-            ledger_info_with_sigs: Some(response_li.into()),
-            txn_list_with_proof: Some(txns.into()),
-        };
+        let chunk_response = GetChunkResponse::new(response_li, txns);
         let msg = StateSynchronizerMsg {
-            message: Some(StateSynchronizerMsg_oneof::ChunkResponse(chunk_response)),
+            message: Some(StateSynchronizerMsg_oneof::ChunkResponse(
+                chunk_response.try_into()?,
+            )),
         };
         if network_sender.send_to(peer_id, msg).await.is_err() {
             error!("[state sync] failed to send p2p message");
@@ -397,7 +574,7 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
     /// * response LI is either the requested target or the highest local LI if target is None.
     /// * if the response LI would not belong to `request_epoch`, change
     /// the response LI to the LI that is terminating `request_epoch`.
-    fn choose_response_li(
+    async fn choose_response_li(
         &self,
         known_version: u64,
         request_epoch: u64,
@@ -407,7 +584,8 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
         if target_li.ledger_info().epoch() > request_epoch {
             let end_of_epoch_li = self
                 .executor_proxy
-                .get_epoch_proof(request_epoch)?
+                .get_epoch_proof(request_epoch, request_epoch + 1)
+                .await?
                 .ledger_info_with_sigs
                 .first()
                 .ok_or_else(|| {
@@ -434,10 +612,8 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
         counters::RESPONSES_RECEIVED
             .with_label_values(&[&*peer_id.to_string()])
             .inc();
-        let txn_list_with_proof: TransactionListWithProof = response
-            .txn_list_with_proof
-            .ok_or_else(|| format_err!("Missing txn_list_with_proof"))?
-            .try_into()?;
+        debug!("[state sync] Processing chunk response {}", response);
+        let txn_list_with_proof = response.txn_list_with_proof.clone();
 
         let known_version = self.local_state.highest_version_in_local_storage();
         let chunk_start_version =
@@ -460,41 +636,32 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
                 chunk_start_version
             );
         }
-        let response_li: LedgerInfoWithSignatures = response
-            .ledger_info_with_sigs
-            .ok_or_else(|| format_err!("Missing ledger_info_with_sigs"))?
-            .try_into()?;
-
-        if let Some(sync_req) = self.sync_request.as_ref() {
-            // Valid responses should not exceed the LI version of the request.
-            if sync_req.target.ledger_info().version() < response_li.ledger_info().version() {
-                self.peer_manager
-                    .update_score(peer_id, PeerScoreUpdateType::InvalidChunk);
-                bail!(
-                    "[state sync] Response from {} has an LI version higher than requested.",
-                    peer_id
-                );
-            }
-        }
 
         let chunk_size = txn_list_with_proof.len() as u64;
-
-        // Optimistically fetch the next chunk assuming the current chunk is going to be applied
-        // successfully.
         let new_version = known_version + chunk_size;
-        let new_epoch = match response_li.ledger_info().next_validator_set() {
-            // This LI carries the validator set for the next epoch.
-            Some(_) => response_li.ledger_info().epoch() + 1,
-            None => response_li.ledger_info().epoch(),
-        };
-        self.send_chunk_request(new_version, new_epoch).await?;
+        match response.response_li {
+            ResponseLedgerInfo::VerifiableLedgerInfo(li) => {
+                self.process_response_with_verifiable_li(txn_list_with_proof, li)
+                    .await
+            }
+            ResponseLedgerInfo::LedgerInfoForWaypoint {
+                waypoint_li,
+                end_of_epoch_li,
+            } => {
+                self.process_response_with_waypoint_li(
+                    txn_list_with_proof,
+                    waypoint_li,
+                    end_of_epoch_li,
+                )
+                .await
+            }
+        }
+        .map_err(|e| {
+            self.peer_manager
+                .update_score(peer_id, PeerScoreUpdateType::InvalidChunk);
+            format_err!("[state sync] failed to apply chunk: {}", e)
+        })?;
 
-        self.validate_and_store_chunk(txn_list_with_proof, response_li)
-            .map_err(|e| {
-                self.peer_manager
-                    .update_score(peer_id, PeerScoreUpdateType::InvalidChunk);
-                format_err!("[state sync] failed to apply chunk: {}", e)
-            })?;
         counters::STATE_SYNC_TXN_REPLAYED.inc_by(chunk_size as i64);
         debug!(
             "[state sync] applied chunk. Previous version: {}, new version: {}, chunk size: {}",
@@ -512,10 +679,81 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
         self.process_commit().await
     }
 
-    fn validate_and_store_chunk(
+    /// Processing chunk responses that carry a LedgerInfo that should be verified using the
+    /// current local trusted validator set.
+    async fn process_response_with_verifiable_li(
+        &mut self,
+        txn_list_with_proof: TransactionListWithProof,
+        response_li: LedgerInfoWithSignatures,
+    ) -> Result<()> {
+        ensure!(
+            self.is_initialized(),
+            "Response with a non-waypoint LI while still not initialized"
+        );
+        if let Some(sync_req) = self.sync_request.as_ref() {
+            // Valid responses should not exceed the LI version of the request.
+            if sync_req.target.ledger_info().version() < response_li.ledger_info().version() {
+                bail!(
+                    "[state sync] Response has an LI version {} higher than requested version {}.",
+                    response_li.ledger_info().version(),
+                    sync_req.target.ledger_info().version(),
+                );
+            }
+        }
+        // Optimistically fetch the next chunk assuming the current chunk is going to be applied
+        // successfully.
+        let new_version =
+            self.local_state.highest_version_in_local_storage() + txn_list_with_proof.len() as u64;
+        let new_epoch = match response_li.ledger_info().next_validator_set() {
+            // This LI carries the validator set for the next epoch.
+            Some(_) => response_li.ledger_info().epoch() + 1,
+            None => response_li.ledger_info().epoch(),
+        };
+        self.send_chunk_request(new_version, new_epoch).await?;
+
+        response_li.verify(self.local_state.verifier())?;
+        self.validate_and_store_chunk(txn_list_with_proof, response_li, None)
+            .await
+    }
+
+    /// Processing chunk responses that carry a LedgerInfo corresponding to the waypoint.
+    async fn process_response_with_waypoint_li(
+        &mut self,
+        txn_list_with_proof: TransactionListWithProof,
+        waypoint_li: LedgerInfoWithSignatures,
+        end_of_epoch_li: Option<LedgerInfoWithSignatures>,
+    ) -> Result<()> {
+        ensure!(
+            !self.is_initialized(),
+            "Response with a waypoint LI but we're already initialized"
+        );
+        // Optimistically fetch the next chunk. The next chunk belongs to the next epoch if
+        // end_of_epoch_li is present.
+        let new_version =
+            self.local_state.highest_version_in_local_storage() + txn_list_with_proof.len() as u64;
+        let new_epoch = end_of_epoch_li
+            .as_ref()
+            .map_or(self.local_state.epoch(), |li| li.ledger_info().epoch() + 1);
+        if new_version < self.waypoint.as_ref().map_or(0, |w| w.version()) {
+            self.send_chunk_request(new_version, new_epoch).await?;
+        }
+
+        self.waypoint
+            .as_ref()
+            .ok_or_else(|| {
+                format_err!("No waypoint found to process a response with a waypoint LI")
+            })
+            .and_then(|w| w.verify(waypoint_li.ledger_info()))?;
+        self.validate_and_store_chunk(txn_list_with_proof, waypoint_li, end_of_epoch_li)
+            .await
+    }
+
+    // Assumes that the target LI has been already verified by the caller.
+    async fn validate_and_store_chunk(
         &mut self,
         txn_list_with_proof: TransactionListWithProof,
         target: LedgerInfoWithSignatures,
+        intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
     ) -> Result<()> {
         let target_epoch_and_round = (target.ledger_info().epoch(), target.ledger_info().round());
         let local_epoch_and_round = (
@@ -529,12 +767,15 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
             );
             return Ok(());
         }
-        target.verify(self.local_state.verifier())?;
-        self.executor_proxy.execute_chunk(
-            txn_list_with_proof,
-            target,
-            &mut self.local_state.synced_trees,
-        )?;
+
+        self.executor_proxy
+            .execute_chunk(
+                txn_list_with_proof,
+                target,
+                intermediate_end_of_epoch_li,
+                &mut self.local_state.synced_trees,
+            )
+            .await?;
         Ok(())
     }
 
@@ -544,7 +785,8 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
         if self.peer_manager.is_empty() {
             return;
         }
-        if self.role == RoleType::Validator && self.sync_request.is_none() {
+        if self.role == RoleType::Validator && self.sync_request.is_none() && self.is_initialized()
+        {
             return;
         }
 
@@ -579,38 +821,37 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
             .pick_peer()
             .ok_or_else(|| format_err!("No peers found for chunk request."))?;
 
-        let mut req = GetChunkRequest::default();
-        req.known_version = known_version;
-        req.current_epoch = known_epoch;
-        req.limit = self.config.chunk_limit;
-        if self.role == RoleType::Validator {
-            let target = self
-                .sync_request
-                .as_ref()
-                .ok_or_else(|| {
-                    format_err!("[state sync] Validator chunk request without a sync request.")
-                })?
-                .target
-                .clone();
-            if target.ledger_info().version() <= known_version {
-                debug!(
-                    "[state sync] Reached version {}, no need to send more requests",
-                    known_version
-                );
-                return Ok(());
-            }
-            req.ledger_info_with_sigs = Some(target.into());
+        let target = if !self.is_initialized() {
+            let waypoint_version =
+                self.waypoint.as_ref().map(|w| w.version()).ok_or_else(|| {
+                    format_err!("No waypoint found but coordinator is not initialized.")
+                })?;
+            TargetType::Waypoint(waypoint_version)
         } else {
-            req.timeout = self.config.long_poll_timeout_ms;
-        }
+            match self.sync_request.as_ref() {
+                None => TargetType::HighestAvailable {
+                    timeout_ms: self.config.long_poll_timeout_ms,
+                },
+                Some(sync_req) => {
+                    if sync_req.target.ledger_info().version() <= known_version {
+                        debug!(
+                            "[state sync] Reached version {}, no need to send more requests",
+                            known_version
+                        );
+                        return Ok(());
+                    }
+                    TargetType::TargetLedgerInfo(sync_req.target.clone())
+                }
+            }
+        };
+        let req = GetChunkRequest::new(known_version, known_epoch, self.config.chunk_limit, target);
         debug!(
-            "[state sync] request next chunk. peer_id: {}, known_version: {}, timeout: {}",
+            "[state sync] request next chunk. peer_id: {}, chunk req: {}",
             peer_id.short_str(),
-            known_version,
-            req.timeout
+            req,
         );
         let msg = StateSynchronizerMsg {
-            message: Some(StateSynchronizerMsg_oneof::ChunkRequest(req)),
+            message: Some(StateSynchronizerMsg_oneof::ChunkRequest(req.try_into()?)),
         };
 
         self.peer_manager
@@ -620,6 +861,25 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
             .with_label_values(&[&*peer_id.to_string()])
             .inc();
         Ok(())
+    }
+
+    async fn deliver_subscription(
+        &self,
+        peer_id: PeerId,
+        sender: StateSynchronizerSender,
+        request_info: PendingRequestInfo,
+    ) -> Result<()> {
+        let response_li = self
+            .choose_response_li(request_info.known_version, request_info.request_epoch, None)
+            .await?;
+        self.deliver_chunk(
+            peer_id,
+            request_info.known_version,
+            ResponseLedgerInfo::VerifiableLedgerInfo(response_li),
+            request_info.limit,
+            sender,
+        )
+        .await
     }
 
     /// The function is called after the local storage is updated with new transactions:
@@ -652,14 +912,7 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
         let mut futures = FuturesUnordered::new();
         for (peer_id, request_info) in ready {
             if let Some(sender) = self.peer_manager.get_network_sender(&peer_id) {
-                futures.push(self.deliver_chunk(
-                    peer_id,
-                    request_info.known_version,
-                    request_info.request_epoch,
-                    request_info.limit,
-                    Some(self.local_state.highest_local_li.clone()),
-                    sender,
-                ));
+                futures.push(self.deliver_subscription(peer_id, sender, request_info));
             }
         }
         while let Some(res) = futures.next().await {
@@ -672,7 +925,11 @@ impl<T: ExecutorProxyTrait> SyncCoordinator<T> {
     async fn get_epoch_proof(&self, request: EpochRetrievalRequest) {
         if request
             .callback
-            .send(self.executor_proxy.get_epoch_proof(request.start_epoch))
+            .send(
+                self.executor_proxy
+                    .get_epoch_proof(request.start_epoch, request.end_epoch)
+                    .await,
+            )
             .is_err()
         {
             error!("[state sync] coordinator failed to send back epoch proof");

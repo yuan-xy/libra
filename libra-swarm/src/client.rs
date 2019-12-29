@@ -43,7 +43,6 @@ impl InteractiveClient {
         port: u16,
         faucet_key_file_path: &Path,
         mnemonic_file_path: &Path,
-        validator_set_file: String,
     ) -> Self {
         // We need to call canonicalize on the path because we are running client from
         // workspace root and the function calling new_with_inherit_io isn't necessarily
@@ -73,8 +72,6 @@ impl InteractiveClient {
                     )
                     .arg("-a")
                     .arg("localhost")
-                    .arg("-s")
-                    .arg(validator_set_file)
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
@@ -88,7 +85,6 @@ impl InteractiveClient {
         port: u16,
         faucet_key_file_path: &Path,
         mnemonic_file_path: &Path,
-        validator_set_file: String,
     ) -> Self {
         Self {
             /// Note: For easier debugging it's convenient to see the output
@@ -117,8 +113,6 @@ impl InteractiveClient {
                     )
                     .arg("-a")
                     .arg("localhost")
-                    .arg("-s")
-                    .arg(validator_set_file)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -148,18 +142,12 @@ pub struct InProcessTestClient {
 }
 
 impl InProcessTestClient {
-    pub fn new(
-        port: u16,
-        faucet_key_file_path: &Path,
-        mnemonic_file_path: &str,
-        validator_set_file: String,
-    ) -> Self {
+    pub fn new(port: u16, faucet_key_file_path: &Path, mnemonic_file_path: &str) -> Self {
         let (_, alias_to_cmd) = commands::get_commands(true);
         Self {
             client: ClientProxy::new(
                 "localhost",
                 port,
-                &validator_set_file,
                 faucet_key_file_path
                     .canonicalize()
                     .expect("Unable to get canonical path of faucet key file")
@@ -168,6 +156,7 @@ impl InProcessTestClient {
                 false,
                 /* faucet server */ None,
                 Some(mnemonic_file_path.to_string()),
+                None,
             )
             .unwrap(),
             alias_to_cmd,

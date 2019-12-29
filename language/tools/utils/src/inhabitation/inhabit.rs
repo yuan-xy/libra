@@ -3,7 +3,7 @@
 
 use vm::file_format::{
     AddressPoolIndex, ByteArrayPoolIndex, Bytecode, CompiledModuleMut, LocalsSignatureIndex,
-    SignatureToken, StructDefinitionIndex, StructFieldInformation, TableIndex, UserStringIndex,
+    SignatureToken, StructDefinitionIndex, StructFieldInformation, TableIndex,
 };
 
 /// Generate a sequence of instructions whose overall effect is to push a single value of type token
@@ -14,9 +14,8 @@ pub fn inhabit_with_bytecode_seq(
     token: &SignatureToken,
 ) -> Vec<Bytecode> {
     match token {
-        SignatureToken::String => vec![Bytecode::LdStr(UserStringIndex::new(0))],
         SignatureToken::Address => vec![Bytecode::LdAddr(AddressPoolIndex::new(0))],
-        SignatureToken::U64 => vec![Bytecode::LdConst(0)],
+        SignatureToken::U64 => vec![Bytecode::LdU64(0)],
         SignatureToken::Bool => vec![Bytecode::LdFalse],
         SignatureToken::ByteArray => vec![Bytecode::LdByteArray(ByteArrayPoolIndex::new(0))],
         SignatureToken::Struct(handle_idx, _fixme) => {

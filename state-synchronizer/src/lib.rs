@@ -13,8 +13,11 @@ extern crate prometheus;
 use executor::ExecutedTrees;
 use libra_types::crypto_proxies::{EpochInfo, ValidatorVerifier};
 use libra_types::{account_address::AccountAddress, crypto_proxies::LedgerInfoWithSignatures};
+use std::sync::Arc;
 pub use synchronizer::{StateSyncClient, StateSynchronizer};
 
+mod chunk_request;
+mod chunk_response;
 mod coordinator;
 mod counters;
 mod executor_proxy;
@@ -49,11 +52,11 @@ impl SynchronizerState {
         let trusted_epoch = match highest_local_li.ledger_info().next_validator_set() {
             Some(validator_set) => EpochInfo {
                 epoch: current_epoch + 1,
-                verifier: validator_set.into(),
+                verifier: Arc::new(validator_set.into()),
             },
             None => EpochInfo {
                 epoch: current_epoch,
-                verifier: current_verifier,
+                verifier: Arc::new(current_verifier),
             },
         };
         SynchronizerState {

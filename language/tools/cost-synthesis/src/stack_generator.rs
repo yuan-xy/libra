@@ -25,10 +25,9 @@ use vm::{
         FunctionDefinition, FunctionDefinitionIndex, FunctionHandleIndex, FunctionSignature,
         LocalIndex, MemberCount, ModuleHandle, SignatureToken, StructDefinition,
         StructDefinitionIndex, StructFieldInformation, StructHandleIndex, TableIndex,
-        UserStringIndex, NO_TYPE_ACTUALS,
+        NO_TYPE_ACTUALS,
     },
     gas_schedule::{AbstractMemorySize, GasAlgebra, GasCarrier},
-    vm_string::VMString,
 };
 use vm_runtime::{
     code_cache::module_cache::ModuleCache, interpreter::InterpreterForCostSynthesis,
@@ -113,9 +112,6 @@ where
     /// The maximum size of the generated value stack.
     max_stack_size: u64,
 
-    /// Cursor into the user string pool. Used for the generation of random user strings.
-    user_string_index: TableIndex,
-
     /// Cursor into the address pool. Used for the generation of random addresses.  We use this since we need the
     /// addresses to be unique, and we don't want a mutable reference into the underlying `root_module`.
     address_pool_index: TableIndex,
@@ -160,7 +156,6 @@ where
             module_cache,
             iters,
             table_size: iters,
-            user_string_index: 0,
             address_pool_index: 0,
             struct_handle_table: HashMap::new(),
             function_handle_table: HashMap::new(),
@@ -192,7 +187,24 @@ where
         }
     }
 
-    fn next_int(&mut self, stk: &[Value]) -> u64 {
+    // TODO: merge the following three.
+    fn next_u8(&mut self, stk: &[Value]) -> u8 {
+        if self.op == Bytecode::Sub && !stk.is_empty() {
+            let peek: VMResult<u8> = stk
+                .last()
+                .expect("[Next Integer] The impossible happened: the value stack became empty while still full.")
+                .clone()
+                .into();
+            self.gen.gen_range(
+                0,
+                peek.expect("[Next Integer] Unable to cast peeked stack value to a u8."),
+            )
+        } else {
+            self.gen.gen_range(0, u8::max_value())
+        }
+    }
+
+    fn next_u64(&mut self, stk: &[Value]) -> u64 {
         if self.op == Bytecode::Sub && !stk.is_empty() {
             let peek: VMResult<u64> = stk
                 .last()
@@ -201,10 +213,26 @@ where
                 .into();
             self.gen.gen_range(
                 0,
-                peek.expect("[Next Integer] Unable to cast peeked stack value to an integer."),
+                peek.expect("[Next Integer] Unable to cast peeked stack value to a u64."),
             )
         } else {
             u64::from(self.gen.gen_range(0, u32::max_value()))
+        }
+    }
+
+    fn next_u128(&mut self, stk: &[Value]) -> u128 {
+        if self.op == Bytecode::Sub && !stk.is_empty() {
+            let peek: VMResult<u128> = stk
+                .last()
+                .expect("[Next Integer] The impossible happened: the value stack became empty while still full.")
+                .clone()
+                .into();
+            self.gen.gen_range(
+                0,
+                peek.expect("[Next Integer] Unable to cast peeked stack value to a u128."),
+            )
+        } else {
+            u128::from(self.gen.gen_range(0, u32::max_value()))
         }
     }
 
@@ -217,24 +245,6 @@ where
         let len: usize = self.gen.gen_range(1, BYTE_ARRAY_MAX_SIZE);
         let bytes: Vec<u8> = (0..len).map(|_| self.gen.gen::<u8>()).collect();
         ByteArray::new(bytes)
-    }
-
-    // Strings and addresses are already randomly generated in the module that we create these
-    // pools from so we simply pop off from them. This assumes that the module was generated with
-    // at least `self.iters` number of strings and addresses. In the case where we are just padding
-    // the stack, or where the instructions semantics don't require having an address in the
-    // address pool, we don't waste our pools and generate a random value.
-    fn next_vm_string(&mut self, is_padding: bool) -> VMString {
-        if is_padding {
-            let len: usize = self.gen.gen_range(1, MAX_STRING_SIZE);
-            random_string(&mut self.gen, len).into()
-        } else {
-            let user_string = self
-                .root_module
-                .user_string_at(UserStringIndex::new(self.user_string_index));
-            self.user_string_index = (self.user_string_index + 1) % self.table_size;
-            user_string.to_owned()
-        }
     }
 
     fn next_addr(&mut self, is_padding: bool) -> AccountAddress {
@@ -251,11 +261,6 @@ where
 
     fn next_bounded_index(&mut self, bound: TableIndex) -> TableIndex {
         self.gen.gen_range(1, bound)
-    }
-
-    fn next_user_string_idx(&mut self) -> UserStringIndex {
-        let len = self.root_module.user_strings().len();
-        UserStringIndex::new(self.gen.gen_range(0, len) as TableIndex)
     }
 
     fn next_address_idx(&mut self) -> AddressPoolIndex {
@@ -301,11 +306,12 @@ where
     }
 
     fn next_stack_value(&mut self, stk: &[Value], is_padding: bool) -> Value {
-        match self.gen.gen_range(0, 5) {
-            0 => Value::u64(self.next_int(stk)),
-            1 => Value::bool(self.next_bool()),
-            2 => Value::string(self.next_vm_string(is_padding)),
-            3 => Value::byte_array(self.next_bytearray()),
+        match self.gen.gen_range(0, 6) {
+            0 => Value::u8(self.next_u8(stk)),
+            1 => Value::u64(self.next_u64(stk)),
+            2 => Value::u128(self.next_u128(stk)),
+            3 => Value::bool(self.next_bool()),
+            4 => Value::byte_array(self.next_bytearray()),
             _ => Value::address(self.next_addr(is_padding)),
         }
     }
@@ -368,14 +374,17 @@ where
                 let index = self.next_bounded_index(frame_len as TableIndex);
                 (Branch(index as CodeOffset), 1)
             }
-            LdConst(_) => {
-                let i = self.next_int(&[]);
-                (LdConst(i), 1)
+            LdU8(_) => {
+                let i = self.next_u8(&[]);
+                (LdU8(i), 1)
             }
-            LdStr(_) => {
-                let string_idx = self.next_user_string_idx();
-                let string_size = self.root_module.user_string_at(string_idx).len();
-                (LdStr(string_idx), string_size)
+            LdU64(_) => {
+                let i = self.next_u64(&[]);
+                (LdU64(i), 1)
+            }
+            LdU128(_) => {
+                let i = self.next_u128(&[]);
+                (LdU128(i), 1)
             }
             LdByteArray(_) => {
                 let bytearray_idx = self.next_bytearray_idx();
@@ -479,8 +488,9 @@ where
     fn resolve_to_value(&mut self, sig_token: &SignatureToken, stk: &[Value]) -> Value {
         match sig_token {
             SignatureToken::Bool => Value::bool(self.next_bool()),
-            SignatureToken::U64 => Value::u64(self.next_int(stk)),
-            SignatureToken::String => Value::string(self.next_vm_string(false)),
+            SignatureToken::U8 => Value::u8(self.next_u8(stk)),
+            SignatureToken::U64 => Value::u64(self.next_u64(stk)),
+            SignatureToken::U128 => Value::u128(self.next_u128(stk)),
             SignatureToken::Address => Value::address(self.next_addr(false)),
             SignatureToken::Reference(sig) | SignatureToken::MutableReference(sig) => {
                 let underlying_value = self.resolve_to_value(sig, stk);

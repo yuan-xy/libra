@@ -8,7 +8,7 @@ use crate::{
     },
     Executor, OP_COUNTERS,
 };
-use config_builder::util;
+use config_builder;
 use grpcio::{EnvBuilder, ServerBuilder};
 use libra_config::config::NodeConfig;
 use libra_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
@@ -28,6 +28,7 @@ use std::{
 use storage_client::{StorageRead, StorageReadServiceClient, StorageWriteServiceClient};
 use storage_proto::proto::storage::create_storage;
 use storage_service::StorageService;
+use tokio::runtime::Runtime;
 
 fn create_storage_server(config: &mut NodeConfig) -> (grpcio::Server, mpsc::Receiver<()>) {
     let (service, shutdown_receiver) = StorageService::new(&config.storage.dir());
@@ -51,6 +52,7 @@ fn create_storage_server(config: &mut NodeConfig) -> (grpcio::Server, mpsc::Rece
 }
 
 fn create_executor(config: &NodeConfig) -> (Executor<MockVM>, ExecutedTrees) {
+    let mut rt = Runtime::new().unwrap();
     let client_env = Arc::new(EnvBuilder::new().build());
     let read_client = Arc::new(StorageReadServiceClient::new(
         Arc::clone(&client_env),
@@ -64,8 +66,8 @@ fn create_executor(config: &NodeConfig) -> (Executor<MockVM>, ExecutedTrees) {
         None,
     ));
     let executor = Executor::new(read_client.clone(), write_client, config);
-    let startup_info = read_client
-        .get_startup_info()
+    let startup_info = rt
+        .block_on(read_client.get_startup_info_async())
         .expect("unable to read ledger info from storage")
         .expect("startup info is None");
     let root_executed_trees = ExecutedTrees::from(startup_info.committed_tree_state);
@@ -117,7 +119,7 @@ struct TestExecutor {
 
 impl TestExecutor {
     fn new() -> (TestExecutor, ExecutedTrees) {
-        let (mut config, _) = util::get_test_config();
+        let (mut config, _) = config_builder::test_config();
         let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
         let (executor, committed_trees) = create_executor(&config);
 
@@ -349,6 +351,7 @@ rusty_fork_test! {
 fn create_transaction_chunks(
     chunk_ranges: Vec<std::ops::Range<Version>>,
 ) -> (Vec<TransactionListWithProof>, LedgerInfoWithSignatures) {
+    let mut rt = Runtime::new().unwrap();
     assert_eq!(chunk_ranges.first().unwrap().start, 1);
     for i in 1..chunk_ranges.len() {
         let previous_range = &chunk_ranges[i - 1];
@@ -361,7 +364,7 @@ fn create_transaction_chunks(
 
     // To obtain the batches of transactions, we first execute and save all these transactions in a
     // separate DB. Then we call get_transactions to retrieve them.
-    let (mut config, _) = util::get_test_config();
+    let (mut config, _) = config_builder::test_config();
     let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
     let (executor, root_trees) = create_executor(&config);
 
@@ -400,14 +403,13 @@ fn create_transaction_chunks(
     let batches: Vec<_> = chunk_ranges
         .into_iter()
         .map(|range| {
-            storage_client
-                .get_transactions(
-                    range.start,
-                    range.end - range.start,
-                    ledger_version,
-                    false, /* fetch_events */
-                )
-                .unwrap()
+            rt.block_on(storage_client.get_transactions_async(
+                range.start,
+                range.end - range.start,
+                ledger_version,
+                false, /* fetch_events */
+            ))
+            .unwrap()
         })
         .collect();
 
@@ -419,6 +421,7 @@ fn create_transaction_chunks(
 
 #[test]
 fn test_executor_execute_and_commit_chunk() {
+    let mut rt = Runtime::new().unwrap();
     let first_batch_size = 30;
     let second_batch_size = 40;
     let third_batch_size = 20;
@@ -436,7 +439,7 @@ fn test_executor_execute_and_commit_chunk() {
     };
 
     // Now we execute these two chunks of transactions.
-    let (mut config, _) = util::get_test_config();
+    let (mut config, _) = config_builder::test_config();
     let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
     let (executor, mut committed_trees) = create_executor(&config);
     let storage_client = StorageReadServiceClient::new(
@@ -447,17 +450,31 @@ fn test_executor_execute_and_commit_chunk() {
 
     // Execute the first chunk. After that we should still get the genesis ledger info from DB.
     executor
-        .execute_and_commit_chunk(chunks[0].clone(), ledger_info.clone(), &mut committed_trees)
+        .execute_and_commit_chunk(
+            chunks[0].clone(),
+            ledger_info.clone(),
+            None,
+            &mut committed_trees,
+        )
         .unwrap();
-    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = rt
+        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
 
     // Execute the second chunk. After that we should still get the genesis ledger info from DB.
     executor
-        .execute_and_commit_chunk(chunks[1].clone(), ledger_info.clone(), &mut committed_trees)
+        .execute_and_commit_chunk(
+            chunks[1].clone(),
+            ledger_info.clone(),
+            None,
+            &mut committed_trees,
+        )
         .unwrap();
-    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = rt
+        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
 
@@ -466,26 +483,43 @@ fn test_executor_execute_and_commit_chunk() {
         .execute_and_commit_chunk(
             TransactionListWithProof::new_empty(),
             ledger_info.clone(),
+            None,
             &mut committed_trees,
         )
         .unwrap();
-    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = rt
+        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
 
     // Execute the second chunk again. After that we should still get the same thing.
     executor
-        .execute_and_commit_chunk(chunks[1].clone(), ledger_info.clone(), &mut committed_trees)
+        .execute_and_commit_chunk(
+            chunks[1].clone(),
+            ledger_info.clone(),
+            None,
+            &mut committed_trees,
+        )
         .unwrap();
-    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = rt
+        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .unwrap();
     assert_eq!(li.ledger_info().version(), 0);
     assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
 
     // Execute the third chunk. After that we should get the new ledger info.
     executor
-        .execute_and_commit_chunk(chunks[2].clone(), ledger_info.clone(), &mut committed_trees)
+        .execute_and_commit_chunk(
+            chunks[2].clone(),
+            ledger_info.clone(),
+            None,
+            &mut committed_trees,
+        )
         .unwrap();
-    let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+    let (_, li, _, _) = rt
+        .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+        .unwrap();
     assert_eq!(li, ledger_info);
 
     drop(storage_server);
@@ -494,6 +528,7 @@ fn test_executor_execute_and_commit_chunk() {
 
 #[test]
 fn test_executor_execute_and_commit_chunk_restart() {
+    let mut rt = Runtime::new().unwrap();
     let first_batch_size = 30;
     let second_batch_size = 40;
 
@@ -506,7 +541,7 @@ fn test_executor_execute_and_commit_chunk_restart() {
         ])
     };
 
-    let (mut config, _) = util::get_test_config();
+    let (mut config, _) = config_builder::test_config();
     let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
     let mut synced_trees;
 
@@ -520,10 +555,17 @@ fn test_executor_execute_and_commit_chunk_restart() {
         );
 
         executor
-            .execute_and_commit_chunk(chunks[0].clone(), ledger_info.clone(), &mut committed_trees)
+            .execute_and_commit_chunk(
+                chunks[0].clone(),
+                ledger_info.clone(),
+                None,
+                &mut committed_trees,
+            )
             .unwrap();
         synced_trees = committed_trees;
-        let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+        let (_, li, _, _) = rt
+            .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+            .unwrap();
         assert_eq!(li.ledger_info().version(), 0);
         assert_eq!(li.ledger_info().consensus_block_id(), *PRE_GENESIS_BLOCK_ID);
     }
@@ -538,9 +580,16 @@ fn test_executor_execute_and_commit_chunk_restart() {
         );
 
         executor
-            .execute_and_commit_chunk(chunks[1].clone(), ledger_info.clone(), &mut synced_trees)
+            .execute_and_commit_chunk(
+                chunks[1].clone(),
+                ledger_info.clone(),
+                None,
+                &mut synced_trees,
+            )
             .unwrap();
-        let (_, li, _, _) = storage_client.update_to_latest_ledger(0, vec![]).unwrap();
+        let (_, li, _, _) = rt
+            .block_on(storage_client.update_to_latest_ledger_async(0, vec![]))
+            .unwrap();
         assert_eq!(li, ledger_info);
     }
 
@@ -690,7 +739,7 @@ proptest! {
         let block_a = TestBlock::new(0..a_size, amount, *PRE_GENESIS_BLOCK_ID, gen_block_id(1));
         let block_b = TestBlock::new(0..b_size, amount, gen_block_id(1), gen_block_id(2));
 
-        let (mut config, _) = util::get_test_config();
+        let (mut config, _) = config_builder::test_config();
         let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
 
         // First execute and commit one block, then destroy executor.
@@ -749,7 +798,7 @@ proptest! {
                 overlap_start..overlap_end
             ]);
 
-        let (mut config, _) = util::get_test_config();
+        let (mut config, _) = config_builder::test_config();
         let (storage_server, shutdown_receiver) = create_storage_server(&mut config);
         let (executor, committed_trees) = create_executor(&config);
 
@@ -759,7 +808,7 @@ proptest! {
 
         let mut synced_trees = committed_trees.clone();
         // Commit the first chunk without committing the ledger info.
-        executor.execute_and_commit_chunk(txn_list_with_proof_to_commit, ledger_info.clone(), &mut synced_trees)
+        executor.execute_and_commit_chunk(txn_list_with_proof_to_commit, ledger_info.clone(), None, &mut synced_trees)
             .unwrap();
 
         let parent_block_id = HashValue::zero();

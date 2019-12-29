@@ -16,12 +16,15 @@ use crate::{
 };
 use anyhow::Result;
 use channel;
-use consensus_types::common::{Payload, Round};
+use consensus_types::common::{Author, Payload, Round};
 use futures::{select, stream::StreamExt};
-use libra_config::config::{ConsensusConfig, ConsensusProposerType, SafetyRulesConfig};
+use libra_config::config::{ConsensusProposerType, NodeConfig};
 use libra_logger::prelude::*;
+use libra_types::crypto_proxies::EpochInfo;
+use safety_rules::SafetyRulesManager;
 use std::{
     sync::Arc,
+    sync::RwLock,
     time::{Duration, Instant},
 };
 use tokio::runtime::{Handle, Runtime};
@@ -38,12 +41,13 @@ pub struct ChainedBftSMRConfig {
     pub contiguous_rounds: u32,
     /// Max block size (number of transactions) that consensus pulls from mempool
     pub max_block_size: u64,
-    /// Path to SafetyRulesConfig
-    pub safety_rules: SafetyRulesConfig,
+    /// Validator's PeerId / Account Address
+    pub author: Author,
 }
 
 impl ChainedBftSMRConfig {
-    pub fn from_node_config(cfg: &ConsensusConfig) -> ChainedBftSMRConfig {
+    pub fn from_node_config(node_cfg: &NodeConfig) -> ChainedBftSMRConfig {
+        let cfg = &node_cfg.consensus;
         let pacemaker_initial_timeout_ms = cfg.pacemaker_initial_timeout_ms.unwrap_or(1000);
         ChainedBftSMRConfig {
             max_pruned_blocks_in_mem: cfg.max_pruned_blocks_in_mem.unwrap_or(10000) as usize,
@@ -51,7 +55,7 @@ impl ChainedBftSMRConfig {
             proposer_type: cfg.proposer_type,
             contiguous_rounds: cfg.contiguous_rounds,
             max_block_size: cfg.max_block_size,
-            safety_rules: cfg.safety_rules.clone(),
+            author: node_cfg.validator_network.as_ref().unwrap().peer_id,
         }
     }
 }
@@ -128,10 +132,12 @@ impl<T: Payload> ChainedBftSMR<T> {
                     }
                     ledger_info = network_receivers.epoch_change.select_next_some() => {
                         idle_duration = pre_select_instant.elapsed();
-                        event_processor = epoch_manager.start_new_epoch(ledger_info);
-                        // clean up all the previous messages from the old epochs
-                        network_receivers.clear_prev_epoch_msgs();
-                        event_processor.start().await;
+                        if epoch_manager.epoch() <= ledger_info.ledger_info().epoch() {
+                            event_processor = epoch_manager.start_new_epoch(ledger_info).await;
+                            // clean up all the previous messages from the old epochs
+                            network_receivers.clear_prev_epoch_msgs();
+                            event_processor.start().await;
+                        }
                     }
                     different_epoch_and_peer = network_receivers.different_epoch.select_next_some() => {
                         idle_duration = pre_select_instant.elapsed();
@@ -161,10 +167,10 @@ impl<T: Payload> StateMachineReplication for ChainedBftSMR<T> {
     /// ProposerElection, Pacemaker, SafetyRules, Network(Populate with known validators), EventProcessor
     fn start(
         &mut self,
-        txn_manager: Arc<dyn TxnManager<Payload = Self::Payload>>,
+        txn_manager: Box<dyn TxnManager<Payload = Self::Payload>>,
         state_computer: Arc<dyn StateComputer<Payload = Self::Payload>>,
     ) -> Result<()> {
-        let initial_setup = self
+        let mut initial_setup = self
             .initial_setup
             .take()
             .expect("already started, initial setup is None");
@@ -182,11 +188,19 @@ impl<T: Payload> StateMachineReplication for ChainedBftSMR<T> {
         let (timeout_sender, timeout_receiver) =
             channel::new(1_024, &counters::PENDING_PACEMAKER_TIMEOUTS);
         let (self_sender, self_receiver) = channel::new(1_024, &counters::PENDING_SELF_MESSAGES);
-        let signer = Arc::new(initial_setup.signer);
-        let epoch = initial_data.epoch();
-        let validators = initial_data.validators();
+        let epoch_info = Arc::new(RwLock::new(EpochInfo {
+            epoch: initial_data.epoch(),
+            verifier: initial_data.validators(),
+        }));
+
+        let safety_rules_manager_config = initial_setup
+            .safety_rules_manager_config
+            .take()
+            .expect("already started, safety_rules_manager is None");
+        let safety_rules_manager = SafetyRulesManager::new(safety_rules_manager_config);
+
         let mut epoch_mgr = EpochManager::new(
-            epoch,
+            Arc::clone(&epoch_info),
             self.config.take().expect("already started, config is None"),
             time_service,
             self_sender,
@@ -195,21 +209,17 @@ impl<T: Payload> StateMachineReplication for ChainedBftSMR<T> {
             txn_manager,
             state_computer,
             self.storage.clone(),
-            signer.clone(),
+            safety_rules_manager,
         );
 
         // Step 2
-        let event_processor = epoch_mgr.start_epoch(signer, initial_data);
+        let event_processor = epoch_mgr.start_epoch(initial_data);
 
         // TODO: this is test only, we should remove this
         self.block_store = Some(event_processor.block_store());
 
-        let (network_task, network_receiver) = NetworkTask::new(
-            epoch,
-            initial_setup.network_events,
-            self_receiver,
-            validators,
-        );
+        let (network_task, network_receiver) =
+            NetworkTask::new(epoch_info, initial_setup.network_events, self_receiver);
 
         Self::start_event_processing(
             executor.clone(),

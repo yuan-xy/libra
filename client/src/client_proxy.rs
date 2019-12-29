@@ -4,17 +4,17 @@
 use crate::{commands::*, grpc_client::GRPCClient, AccountData, AccountStatus};
 use admission_control_proto::proto::admission_control::SubmitTransactionRequest;
 use anyhow::{bail, ensure, format_err, Error, Result};
-use libra_config::config::{ConsensusPeersConfig, PersistableConfig};
 use libra_crypto::{ed25519::*, test_utils::KeyPair};
 use libra_logger::prelude::*;
 use libra_tools::tempdir::TempPath;
-use libra_types::crypto_proxies::EpochInfo;
+use libra_types::crypto_proxies::LedgerInfoWithSignatures;
+use libra_types::waypoint::Waypoint;
 use libra_types::{
     access_path::AccessPath,
     account_address::{AccountAddress, ADDRESS_LENGTH},
     account_config::{
-        association_address, core_code_address, get_account_resource_or_default, AccountResource,
-        ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_SENT_EVENT_PATH,
+        association_address, core_code_address, AccountResource, ACCOUNT_RECEIVED_EVENT_PATH,
+        ACCOUNT_SENT_EVENT_PATH,
     },
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::{ContractEvent, EventWithProof},
@@ -107,19 +107,13 @@ impl ClientProxy {
     pub fn new(
         host: &str,
         ac_port: u16,
-        validator_set_file: &str,
         faucet_account_file: &str,
         sync_on_wallet_recovery: bool,
         faucet_server: Option<String>,
         mnemonic_file: Option<String>,
+        waypoint: Option<Waypoint>,
     ) -> Result<Self> {
-        let verifier =
-            ConsensusPeersConfig::load_config(validator_set_file)?.get_validator_verifier();
-        ensure!(
-            !verifier.is_empty(),
-            "Not able to load any validators from trusted peers config!"
-        );
-        let client = GRPCClient::new(host, ac_port, EpochInfo { epoch: 1, verifier })?;
+        let mut client = GRPCClient::new(host, ac_port, waypoint)?;
 
         let accounts = vec![];
 
@@ -130,7 +124,7 @@ impl ClientProxy {
             let faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> =
                 ClientProxy::load_faucet_account_file(faucet_account_file);
             let faucet_account_data = Self::get_account_data_from_address(
-                &client,
+                &mut client,
                 association_address(),
                 true,
                 Some(KeyPair::<Ed25519PrivateKey, _>::from(
@@ -181,10 +175,20 @@ impl ClientProxy {
     pub fn create_next_account(&mut self, sync_with_validator: bool) -> Result<AddressAndIndex> {
         let (address, _) = self.wallet.new_address()?;
 
-        let account_data =
-            Self::get_account_data_from_address(&self.client, address, sync_with_validator, None)?;
+        let account_data = Self::get_account_data_from_address(
+            &mut self.client,
+            address,
+            sync_with_validator,
+            None,
+        )?;
 
         Ok(self.insert_account_data(account_data))
+    }
+
+    /// Returns the ledger info corresonding to the latest epoch change
+    /// (could further be used for e.g., generating a waypoint)
+    pub fn latest_epoch_change_li(&self) -> Option<LedgerInfoWithSignatures> {
+        self.client.latest_epoch_change_li()
     }
 
     /// Print index and address of all accounts.
@@ -290,6 +294,8 @@ impl ClientProxy {
         let receiver = self.get_account_address_from_parameter(space_delim_strings[1])?;
         let num_coins = Self::convert_to_micro_libras(space_delim_strings[2])?;
 
+        ensure!(num_coins > 0, "Invalid number of coins to mint.");
+
         match self.faucet_account {
             Some(_) => self.association_transaction_with_local_faucet_account(
                 transaction_builder::encode_mint_script(&receiver, num_coins),
@@ -302,9 +308,14 @@ impl ClientProxy {
     /// Remove a existing validator.
     pub fn remove_validator(
         &mut self,
-        account_address: AccountAddress,
+        space_delim_strings: &[&str],
         is_blocking: bool,
     ) -> Result<()> {
+        ensure!(
+            space_delim_strings.len() == 2,
+            "Invalid number of arguments for removing validator"
+        );
+        let account_address = self.get_account_address_from_parameter(space_delim_strings[1])?;
         match self.faucet_account {
             Some(_) => self.association_transaction_with_local_faucet_account(
                 transaction_builder::encode_remove_validator_script(&account_address),
@@ -315,11 +326,12 @@ impl ClientProxy {
     }
 
     /// Add a new validator.
-    pub fn add_validator(
-        &mut self,
-        account_address: AccountAddress,
-        is_blocking: bool,
-    ) -> Result<()> {
+    pub fn add_validator(&mut self, space_delim_strings: &[&str], is_blocking: bool) -> Result<()> {
+        ensure!(
+            space_delim_strings.len() == 2,
+            "Invalid number of arguments for removing validator"
+        );
+        let account_address = self.get_account_address_from_parameter(space_delim_strings[1])?;
         match self.faucet_account {
             Some(_) => self.association_transaction_with_local_faucet_account(
                 transaction_builder::encode_add_validator_script(&account_address),
@@ -335,7 +347,6 @@ impl ClientProxy {
         print!("waiting ");
         loop {
             stdout().flush().unwrap();
-            max_iterations -= 1;
 
             match self
                 .client
@@ -348,15 +359,16 @@ impl ClientProxy {
                     }
                     break;
                 }
-                Ok(_) if max_iterations == 0 => {
-                    panic!("wait_for_transaction timeout");
-                }
                 Err(e) => {
                     println!("Response with error: {:?}", e);
                 }
                 _ => {
                     print!(".");
                 }
+            }
+            max_iterations -= 1;
+            if max_iterations == 0 {
+                panic!("wait_for_transaction timeout");
             }
             thread::sleep(time::Duration::from_millis(10));
         }
@@ -805,7 +817,7 @@ impl ClientProxy {
         let mut account_data = Vec::new();
         for address in wallet_addresses {
             account_data.push(Self::get_account_data_from_address(
-                &self.client,
+                &mut self.client,
                 address,
                 self.sync_on_wallet_recovery,
                 None,
@@ -831,9 +843,10 @@ impl ClientProxy {
     }
 
     /// Test gRPC client connection with validator.
-    pub fn test_validator_connection(&self) -> Result<()> {
-        self.client.get_with_proof_sync(vec![])?;
-        Ok(())
+    pub fn test_validator_connection(&mut self) -> Result<LedgerInfoWithSignatures> {
+        self.client
+            .get_with_proof_sync(vec![])
+            .map(|res| res.ledger_info_with_sigs)
     }
 
     /// Get account state from validator and update status of account if it is cached locally.
@@ -863,14 +876,18 @@ impl ClientProxy {
         address: AccountAddress,
     ) -> Result<AccountResource> {
         let account_state = self.get_account_state_and_update(address)?;
-        get_account_resource_or_default(&account_state.0)
+        if let Some(blob) = account_state.0 {
+            AccountResource::try_from(&blob)
+        } else {
+            bail!("No account exists at {:?}", address)
+        }
     }
 
     /// Get account using specific address.
     /// Sync with validator for account sequence number in case it is already created on chain.
     /// This assumes we have a very low probability of mnemonic word conflict.
     fn get_account_data_from_address(
-        client: &GRPCClient,
+        client: &mut GRPCClient,
         address: AccountAddress,
         sync_with_validator: bool,
         key_pair: Option<KeyPair<Ed25519PrivateKey, Ed25519PublicKey>>,
@@ -879,8 +896,7 @@ impl ClientProxy {
             match client.get_account_blob(address) {
                 Ok(resp) => match resp.0 {
                     Some(account_state_blob) => (
-                        get_account_resource_or_default(&Some(account_state_blob))?
-                            .sequence_number(),
+                        AccountResource::try_from(&account_state_blob)?.sequence_number(),
                         AccountStatus::Persisted,
                     ),
                     None => (0, AccountStatus::Local),
@@ -1130,7 +1146,6 @@ impl fmt::Display for AccountEntry {
 #[cfg(test)]
 mod tests {
     use crate::client_proxy::{parse_bool, AddressAndIndex, ClientProxy};
-    use libra_config::config::{ConsensusConfig, PersistableConfig};
     use libra_tools::tempdir::TempPath;
     use libra_wallet::io_utils;
     use proptest::prelude::*;
@@ -1141,25 +1156,16 @@ mod tests {
         let file = TempPath::new();
         let mnemonic_path = file.path().to_str().unwrap().to_string();
 
-        let consensus_config = ConsensusConfig::default();
-        let consensus_peer_file = TempPath::new();
-        let consensus_peers_path = consensus_peer_file.path();
-        consensus_config
-            .consensus_peers
-            .save_config(consensus_peers_path)
-            .expect("Unable to save consensus_peers.config");
-        let val_set_file = consensus_peers_path.to_str().unwrap().to_string();
-
         // We don't need to specify host/port since the client won't be used to connect, only to
         // generate random accounts
         let mut client_proxy = ClientProxy::new(
             "", /* host */
             0,  /* port */
-            &val_set_file,
             &"",
             false,
             None,
             Some(mnemonic_path),
+            None,
         )
         .unwrap();
         for _ in 0..count {

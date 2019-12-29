@@ -246,20 +246,29 @@ impl<Location: Clone + Eq + Default> Disassembler<Location> {
     ) -> Result<String> {
         Ok(match sig_tok {
             SignatureToken::Bool => "bool".to_string(),
+            SignatureToken::U8 => "u8".to_string(),
             SignatureToken::U64 => "u64".to_string(),
-            SignatureToken::String => "string".to_string(),
+            SignatureToken::U128 => "u128".to_string(),
             SignatureToken::ByteArray => "bytearray".to_string(),
             SignatureToken::Address => "address".to_string(),
-            SignatureToken::Struct(struct_handle_idx, _) => self
-                .source_mapper
-                .bytecode
-                .identifier_at(
-                    self.source_mapper
-                        .bytecode
-                        .struct_handle_at(struct_handle_idx)
-                        .name,
-                )
-                .to_string(),
+            SignatureToken::Struct(struct_handle_idx, instantiation) => {
+                let instantiation = instantiation
+                    .into_iter()
+                    .map(|tok| self.disassemble_sig_tok(tok, type_param_context))
+                    .collect::<Result<Vec<_>>>()?;
+                let formatted_instantiation = Self::format_type_params(&instantiation);
+                let name = self
+                    .source_mapper
+                    .bytecode
+                    .identifier_at(
+                        self.source_mapper
+                            .bytecode
+                            .struct_handle_at(struct_handle_idx)
+                            .name,
+                    )
+                    .to_string();
+                format!("{}{}", name, formatted_instantiation)
+            }
             SignatureToken::Reference(sig_tok) => format!(
                 "&{}",
                 self.disassemble_sig_tok(*sig_tok, type_param_context)?
@@ -299,10 +308,6 @@ impl<Location: Clone + Eq + Default> Disassembler<Location> {
             Bytecode::LdByteArray(byte_array_idx) => {
                 let bytearray = self.source_mapper.bytecode.byte_array_at(*byte_array_idx);
                 Ok(format!("LdByteArray[{}]({:?})", byte_array_idx, bytearray))
-            }
-            Bytecode::LdStr(string_idx) => {
-                let string = self.source_mapper.bytecode.user_string_at(*string_idx);
-                Ok(format!("LdStr[{}]({})", string_idx, string.as_str()))
             }
             Bytecode::CopyLoc(local_idx) => {
                 let name = self.name_for_local(u64::from(*local_idx), function_source_map)?;

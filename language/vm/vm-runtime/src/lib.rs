@@ -114,15 +114,15 @@ mod counters;
 #[cfg(feature = "mirai-contracts")]
 pub mod foreign_contracts;
 
-mod block_processor;
 #[macro_use]
 pub mod gas_meter;
 mod libra_vm;
-mod process_txn;
+mod move_vm;
 mod system_txn;
 #[cfg(test)]
 mod unit_tests;
 
+pub mod chain_state;
 pub mod code_cache;
 pub mod data_cache;
 pub mod execution_context;
@@ -130,10 +130,10 @@ pub mod identifier;
 pub mod interpreter;
 pub mod loaded_data;
 pub mod runtime;
+pub mod system_module_names;
 pub mod txn_executor;
 
 pub use libra_vm::LibraVM;
-pub use txn_executor::execute_function_in_module;
 
 use libra_config::config::VMConfig;
 use libra_state_view::StateView;

@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{counters, state_replication::StateComputer};
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use consensus_types::block::Block;
 use consensus_types::executed_block::ExecutedBlock;
 use executor::{ExecutedTrees, Executor, ProcessedVMOutput};
-use futures::{Future, FutureExt};
 use libra_logger::prelude::*;
-use libra_types::crypto_proxies::ValidatorChangeEventWithProof;
+use libra_types::crypto_proxies::ValidatorChangeProof;
 use libra_types::{
     crypto_proxies::LedgerInfoWithSignatures,
     transaction::{SignedTransaction, Transaction},
@@ -16,7 +15,6 @@ use libra_types::{
 use state_synchronizer::StateSyncClient;
 use std::{
     convert::TryFrom,
-    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -50,6 +48,7 @@ impl ExecutionProxy {
     }
 }
 
+#[async_trait::async_trait]
 impl StateComputer for ExecutionProxy {
     type Payload = Vec<SignedTransaction>;
 
@@ -72,39 +71,34 @@ impl StateComputer for ExecutionProxy {
                 block.parent_id(),
                 block.id(),
             )
-            .map(|output| {
+            .and_then(|output| {
                 let execution_duration = pre_execution_instant.elapsed();
                 let num_txns = output.transaction_data().len();
-                if num_txns == 0 {
-                    // no txns in that block
-                    counters::EMPTY_BLOCK_EXECUTION_DURATION_S.observe_duration(execution_duration);
-                } else {
-                    counters::BLOCK_EXECUTION_DURATION_S.observe_duration(execution_duration);
-                    if let Ok(nanos_per_txn) =
-                        u64::try_from(execution_duration.as_nanos() / num_txns as u128)
-                    {
-                        // TODO: use duration_float once it's stable
-                        // Tracking: https://github.com/rust-lang/rust/issues/54361
-                        counters::TXN_EXECUTION_DURATION_S
-                            .observe_duration(Duration::from_nanos(nanos_per_txn));
-                    }
+                ensure!(num_txns > 0, "metadata txn failed to execute");
+                counters::BLOCK_EXECUTION_DURATION_S.observe_duration(execution_duration);
+                if let Ok(nanos_per_txn) =
+                    u64::try_from(execution_duration.as_nanos() / num_txns as u128)
+                {
+                    // TODO: use duration_float once it's stable
+                    // Tracking: https://github.com/rust-lang/rust/issues/54361
+                    counters::TXN_EXECUTION_DURATION_S
+                        .observe_duration(Duration::from_nanos(nanos_per_txn));
                 }
-                output
+                Ok(output)
             })
     }
 
     /// Send a successful commit. A future is fulfilled when the state is finalized.
-    fn commit(
+    async fn commit(
         &self,
         blocks: Vec<&ExecutedBlock<Self::Payload>>,
         finality_proof: LedgerInfoWithSignatures,
         committed_trees: &ExecutedTrees,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    ) -> Result<()> {
         let version = finality_proof.ledger_info().version();
         counters::LAST_COMMITTED_VERSION.set(version as i64);
 
         let pre_commit_instant = Instant::now();
-        let synchronizer = Arc::clone(&self.synchronizer);
 
         let committable_blocks = blocks
             .into_iter()
@@ -116,38 +110,28 @@ impl StateComputer for ExecutionProxy {
             })
             .collect();
 
-        let commit_result =
-            self.executor
-                .commit_blocks(committable_blocks, finality_proof, committed_trees);
-        async move {
-            match commit_result {
-                Ok(()) => {
-                    counters::BLOCK_COMMIT_DURATION_S
-                        .observe_duration(pre_commit_instant.elapsed());
-                    if let Err(e) = synchronizer.commit().await {
-                        error!("failed to notify state synchronizer: {:?}", e);
-                    }
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
+        self.executor
+            .commit_blocks(committable_blocks, finality_proof, committed_trees)?;
+        counters::BLOCK_COMMIT_DURATION_S.observe_duration(pre_commit_instant.elapsed());
+        if let Err(e) = self.synchronizer.commit().await {
+            error!("failed to notify state synchronizer: {:?}", e);
         }
-            .boxed()
+        Ok(())
     }
 
     /// Synchronize to a commit that not present locally.
-    fn sync_to(
-        &self,
-        target: LedgerInfoWithSignatures,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    async fn sync_to(&self, target: LedgerInfoWithSignatures) -> Result<()> {
         counters::STATE_SYNC_COUNT.inc();
-        self.synchronizer.sync_to(target).boxed()
+        self.synchronizer.sync_to(target).await
     }
 
-    fn get_epoch_proof(
+    async fn get_epoch_proof(
         &self,
         start_epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<ValidatorChangeEventWithProof>> + Send>> {
-        self.synchronizer.get_epoch_proof(start_epoch).boxed()
+        end_epoch: u64,
+    ) -> Result<ValidatorChangeProof> {
+        self.synchronizer
+            .get_epoch_proof(start_epoch, end_epoch)
+            .await
     }
 }

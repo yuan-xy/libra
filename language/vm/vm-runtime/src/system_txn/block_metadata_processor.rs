@@ -2,10 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    data_cache::BlockDataCache,
-    process_txn::execute::ExecutedTransaction,
-    runtime::VMRuntime,
-    txn_executor::{TransactionExecutor, LIBRA_SYSTEM_MODULE},
+    data_cache::BlockDataCache, runtime::VMRuntime, system_module_names::LIBRA_SYSTEM_MODULE,
+    txn_executor::TransactionExecutor,
 };
 use lazy_static::lazy_static;
 use libra_state_view::StateView;
@@ -30,7 +28,7 @@ pub(crate) fn process_block_metadata(
     runtime: &VMRuntime,
     state_view: &dyn StateView,
     data_cache: &mut BlockDataCache<'_>,
-) -> TransactionOutput {
+) -> Result<TransactionOutput, VMStatus> {
     // TODO: How should we setup the metadata here? A couple of thoughts here:
     // 1. We might make the txn_data to be poisoned so that reading anything will result in a panic.
     // 2. The most important consideration is figuring out the sender address.  Having a notion of a
@@ -63,11 +61,10 @@ pub(crate) fn process_block_metadata(
     } else {
         Err(VMStatus::new(StatusCode::MALFORMED))
     };
-    match result.and_then(|_| txn_executor.make_write_set(vec![], Ok(()))) {
-        Ok(output) => {
+    result
+        .and_then(|_| txn_executor.make_write_set(vec![], Ok(())))
+        .and_then(|output| {
             data_cache.push_write_set(output.write_set());
-            output
-        }
-        Err(err) => ExecutedTransaction::discard_error_output(err),
-    }
+            Ok(output)
+        })
 }

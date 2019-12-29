@@ -61,8 +61,9 @@ impl Resolver {
     ) -> Result<SignatureToken, VMStatus> {
         match sig_token {
             SignatureToken::Bool
+            | SignatureToken::U8
             | SignatureToken::U64
-            | SignatureToken::String
+            | SignatureToken::U128
             | SignatureToken::ByteArray
             | SignatureToken::Address
             | SignatureToken::TypeParameter(_) => Ok(sig_token.clone()),

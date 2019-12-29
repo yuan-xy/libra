@@ -2,12 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module translates the bytecode of a module to Boogie code.
+//!
+//! TODO: there is several cleanup to do in this module.
+//!
+//! 1. We should generalize the state and various helper functions into an 'environment'/'context'
+//!    abstraction which is shared between phases like bytecode and spec translation. This
+//!    environment should. among other things, allow to collect diagnostics related to the
+//!    translation.
+//! 2. We should factor out basic functions which represent interacting with the boogie model,
+//!    for example, how to construct a TypeValue from a SignatureToken, how to access memory,
+//!    and so on.
 
-use bytecode_source_map::source_map::{ModuleSourceMap, SourceMap};
+use crate::spec_translator::SpecTranslator;
+use bytecode_source_map::source_map::ModuleSourceMap;
 use bytecode_verifier::VerifiedModule;
 use ir_to_bytecode::parser::ast::Loc;
+use ir_to_bytecode_syntax::spec_language_ast::Condition;
 use itertools::Itertools;
 use libra_types::{account_address::AccountAddress, identifier::Identifier};
+use log::info;
 use num::{BigInt, Num};
 use stackless_bytecode_generator::{
     stackless_bytecode::StacklessBytecode::{self, *},
@@ -28,9 +41,33 @@ use vm::{
     },
 };
 
-pub struct BoogieTranslator {
-    pub modules: Vec<VerifiedModule>,
-    pub source_maps: SourceMap<Loc>,
+/// Represents information about a module.
+#[derive(Debug)]
+pub struct ModuleInfo {
+    /// The name of this module.
+    pub name: String,
+    /// List of function specifications, in function declaration order.
+    pub function_infos: Vec<FunctionInfo>,
+}
+
+/// Represents information about a function.
+#[derive(Debug)]
+pub struct FunctionInfo {
+    /// Index of this function in the function definition table.
+    pub index: FunctionDefinitionIndex,
+    /// List of function argument names. Those aren't present in the bytecode but we obtain them
+    /// from the AST.
+    pub arg_names: Vec<String>,
+    /// List of type argument names.
+    pub type_arg_names: Vec<String>,
+    /// List of specification conditions.
+    pub specification: Vec<Condition>,
+}
+
+pub struct BoogieTranslator<'a> {
+    pub modules: &'a [VerifiedModule],
+    pub module_infos: &'a [ModuleInfo],
+    pub source_maps: &'a [ModuleSourceMap<Loc>],
     pub struct_defs: BTreeMap<String, usize>,
     pub max_struct_depth: usize,
     pub module_name_to_idx: BTreeMap<Identifier, usize>,
@@ -39,25 +76,31 @@ pub struct BoogieTranslator {
 }
 
 pub struct ModuleTranslator<'a> {
+    pub parent: &'a BoogieTranslator<'a>,
     pub module: &'a VerifiedModule,
+    pub module_info: &'a ModuleInfo,
     pub source_map: &'a ModuleSourceMap<Loc>,
     pub stackless_bytecode: Vec<StacklessFunction>,
     pub all_type_strs: BTreeSet<String>,
     pub ignore: bool,
 }
 
-impl BoogieTranslator {
-    pub fn new(modules: &[VerifiedModule], source_maps: &[ModuleSourceMap<Loc>]) -> Self {
+impl<'a> BoogieTranslator<'a> {
+    pub fn new(
+        modules: &'a [VerifiedModule],
+        module_infos: &'a [ModuleInfo],
+        source_maps: &'a [ModuleSourceMap<Loc>],
+    ) -> Self {
         let mut struct_defs: BTreeMap<String, usize> = BTreeMap::new();
         let mut module_name_to_idx: BTreeMap<Identifier, usize> = BTreeMap::new();
         for (module_idx, module) in modules.iter().enumerate() {
-            let module_name =
-                module.identifier_at(module.module_handle_at(ModuleHandleIndex::new(0)).name);
-            module_name_to_idx.insert(module_name.into(), module_idx);
+            let module_name = module_name(module);
+            let module_str = module_name.to_string();
+            module_name_to_idx.insert(module_name, module_idx);
             for (idx, struct_def) in module.struct_defs().iter().enumerate() {
                 let struct_name = format!(
                     "{}_{}",
-                    module_name,
+                    module_str,
                     module
                         .identifier_at(module.struct_handle_at(struct_def.struct_handle).name)
                         .to_string()
@@ -66,8 +109,9 @@ impl BoogieTranslator {
             }
         }
         Self {
-            modules: modules.to_vec(),
-            source_maps: source_maps.to_vec(),
+            modules,
+            module_infos,
+            source_maps,
             struct_defs,
             max_struct_depth: 0,
             module_name_to_idx,
@@ -96,15 +140,17 @@ impl BoogieTranslator {
     }
 
     pub fn translate(&mut self) -> String {
-        let mut res = String::from("\n\n// everything below is auto generated\n\n");
+        let mut res = String::new();
         // generate names and struct specific functions for all structs
         res.push_str(&self.emit_struct_code());
 
-        // generate IsPrefix and UpdateValue to the max depth
-        res.push_str(&self.emit_stratified_functions());
-
         for (module_idx, module) in self.modules.iter().enumerate() {
-            let mut mt = ModuleTranslator::new(self, &module, &self.source_maps[module_idx]);
+            let mut mt = ModuleTranslator::new(
+                self,
+                &module,
+                &self.module_infos[module_idx],
+                &self.source_maps[module_idx],
+            );
             res.push_str(&mt.translate());
         }
         res
@@ -119,6 +165,10 @@ impl BoogieTranslator {
                     res.push_str(s);
                 }
             };
+            emit_str(&format!(
+                "\n\n// ** structs of module {}\n\n",
+                module_name(module)
+            ));
             for (def_idx, struct_def) in module.struct_defs().iter().enumerate() {
                 // Emit TypeName
                 let struct_name = struct_name_from_handle_index(module, struct_def.struct_handle);
@@ -144,18 +194,16 @@ impl BoogieTranslator {
                     .enumerate()
                     .map(|(i, _)| format!("tv{0}: TypeValue", i))
                     .join(", ");
-                let field_type_map = field_infos
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, sig))| format!("[{} := {}]", i, format_type_value(module, sig)))
-                    .join("");
+                let mut field_types = String::from("EmptyTypeValueArray");
+                for (_, field_type) in field_infos {
+                    field_types = format!(
+                        "ExtendTypeValueArray({}, {})",
+                        field_types,
+                        format_type_value(module, &field_type)
+                    );
+                }
 
-                let type_value = format!(
-                    "StructType({}, TypeValueArray(DefaultTypeMap{}, {}))",
-                    struct_name,
-                    field_type_map,
-                    field_infos.len(),
-                );
+                let type_value = format!("StructType({}, {})", struct_name, field_types);
                 emit_str(&format!(
                     "function {}_type_value({}): TypeValue {{\n    {}\n}}\n",
                     struct_name, type_args, type_value
@@ -218,8 +266,9 @@ impl BoogieTranslator {
 
 impl<'a> ModuleTranslator<'a> {
     pub fn new(
-        parent: &BoogieTranslator,
+        parent: &'a BoogieTranslator,
         module: &'a VerifiedModule,
+        module_info: &'a ModuleInfo,
         source_map: &'a ModuleSourceMap<Loc>,
     ) -> Self {
         let stackless_bytecode = StacklessModuleGenerator::new(module.as_inner()).generate_module();
@@ -229,7 +278,9 @@ impl<'a> ModuleTranslator<'a> {
             all_type_strs.insert(struct_name);
         }
         Self {
+            parent,
             module,
+            module_info,
             source_map,
             stackless_bytecode,
             all_type_strs,
@@ -242,11 +293,16 @@ impl<'a> ModuleTranslator<'a> {
         if self.ignore {
             return res;
         }
+        info!("translating module {}", module_name(self.module));
+        res.push_str(&format!(
+            "\n\n// ** functions of module {}\n\n",
+            module_name(self.module)
+        ));
         // translation of stackless bytecode
         for (idx, function_def) in self.module.function_defs().iter().enumerate() {
             if function_def.is_native() {
                 res.push_str(&self.generate_function_sig(idx, true, &None));
-                res.push_str(";\n");
+                res.push_str(";");
                 continue;
             }
             res.push_str(&self.translate_function(idx));
@@ -258,6 +314,7 @@ impl<'a> ModuleTranslator<'a> {
         let mut res = String::new();
         // generate inline function with function body
         res.push_str(&self.generate_function_sig(idx, true, &None)); // inlined version of function
+        res.push_str(&self.generate_function_spec(idx, &None));
         res.push_str(&self.generate_inline_function_body(idx, &None)); // generate function body
         res.push_str("\n");
 
@@ -277,6 +334,7 @@ impl<'a> ModuleTranslator<'a> {
         let fun_name = self.function_name_from_definition_index(func_idx);
         let mut var_decls = String::new();
         let mut res = String::new();
+        let propagate_abort = "if (abort_flag) { goto Label_Abort; }".to_string();
         let stmts = match bytecode {
             Branch(target) => vec![format!("goto Label_{};", target)],
             BrTrue(target, idx) => {
@@ -295,7 +353,7 @@ impl<'a> ModuleTranslator<'a> {
                         (String::new(), String::new())
                     };
                 vec![format!(
-                    "tmp := contents#Memory(m)[old_size + {}];\nif (b#Boolean(tmp)) {{ {}goto Label_{}; }}{}",
+                    "tmp := GetLocal(m, old_size + {});\nif (b#Boolean(tmp)) {{ {}goto Label_{}; }}{}",
                     idx, dbg_branch_taken_str, target, dbg_branch_not_taken_str
                 )]
             }
@@ -315,7 +373,7 @@ impl<'a> ModuleTranslator<'a> {
                         (String::new(), String::new())
                     };
                 vec![format!(
-                    "tmp := contents#Memory(m)[old_size + {}];\n    if (!b#Boolean(tmp)) {{ {}goto Label_{}; }}{}",
+                    "tmp := GetLocal(m, old_size + {});\n    if (!b#Boolean(tmp)) {{ {}goto Label_{}; }}{}",
                     idx, dbg_branch_taken_str, target, dbg_branch_not_taken_str
                 )]
             }
@@ -328,8 +386,11 @@ impl<'a> ModuleTranslator<'a> {
                     )]
                 } else {
                     vec![
-                        format!("call tmp := CopyOrMoveValue(contents#Memory(m)[old_size+{}]);", src),
-                        format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);",dest, dest),
+                        format!(
+                            "call tmp := CopyOrMoveValue(GetLocal(m, old_size + {}));",
+                            src
+                        ),
+                        format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
                     ]
                 }
             }
@@ -342,8 +403,11 @@ impl<'a> ModuleTranslator<'a> {
                     )]
                 } else {
                     vec![
-                        format!("call tmp := CopyOrMoveValue(contents#Memory(m)[old_size+{}]);", src),
-                        format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                        format!(
+                            "call tmp := CopyOrMoveValue(GetLocal(m, old_size + {}));",
+                            src
+                        ),
+                        format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
                     ]
                 }
             }
@@ -356,18 +420,24 @@ impl<'a> ModuleTranslator<'a> {
                     )]
                 } else {
                     vec![
-                        format!("call tmp := CopyOrMoveValue(contents#Memory(m)[old_size+{}]);", src),
-                        format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                        format!(
+                            "call tmp := CopyOrMoveValue(GetLocal(m, old_size + {}));",
+                            src
+                        ),
+                        format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
                     ]
                 }
             }
             BorrowLoc(dest, src) => vec![format!("call t{} := BorrowLoc(old_size+{});", dest, src)],
             ReadRef(dest, src) => vec![
                 format!("call tmp := ReadRef(t{});", src),
-                self.format_type_checking("tmp".to_string(), &self.get_local_type(*dest, func_idx)),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format_type_checking(self.module, "tmp".to_string(), &self.get_local_type(*dest, func_idx)),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
-            WriteRef(dest, src) => vec![format!("call WriteRef(t{}, contents#Memory(m)[old_size+{}]);", dest, src)],
+            WriteRef(dest, src) => vec![format!(
+                "call WriteRef(t{}, GetLocal(m, old_size + {}));",
+                dest, src
+            )],
             FreezeRef(dest, src) => vec![format!("call t{} := FreezeRef(t{});", dest, src)],
             Call(dests, callee_index, type_actuals, args) => {
                 let callee_name = self.function_name_from_handle_index(*callee_index);
@@ -384,7 +454,7 @@ impl<'a> ModuleTranslator<'a> {
                     if self.is_local_ref(*arg, func_idx) {
                         args_str.push_str(&format!("t{}", arg));
                     } else {
-                        args_str.push_str(&format!("contents#Memory(m)[old_size+{}]", arg));
+                        args_str.push_str(&format!("GetLocal(m, old_size + {})", arg));
                     }
                 }
                 for (i, dest) in dests.iter().enumerate() {
@@ -392,14 +462,15 @@ impl<'a> ModuleTranslator<'a> {
                         dest_str.push_str(", ");
                     }
                     dest_str.push_str(&format!("t{}", dest));
-                    dest_type_assumptions.push(self.format_type_checking(
+                    dest_type_assumptions.push(format_type_checking(self.module,
                         format!("t{}", dest),
                         &self.get_local_type(*dest, func_idx),
                     ));
                     if !self.is_local_ref(*dest, func_idx) {
                         tmp_assignments.push(format!(
-                            "m := Memory(domain#Memory(m)[old_size+{} := true], contents#Memory(m)[old_size+{} := t{}]);",
-                            dest, dest, dest));
+                            "m := UpdateLocal(m, old_size + {}, t{});",
+                            dest, dest
+                        ));
                     }
                 }
                 let mut res_vec = vec![];
@@ -411,6 +482,7 @@ impl<'a> ModuleTranslator<'a> {
                         dest_str, callee_name, args_str
                     ));
                 }
+                res_vec.push(propagate_abort);
                 res_vec.extend(dest_type_assumptions);
                 res_vec.extend(tmp_assignments);
                 res_vec
@@ -420,18 +492,18 @@ impl<'a> ModuleTranslator<'a> {
                 let mut fields_str = String::new();
                 let mut res_vec = vec![];
                 fields_str.push_str(&format_type_actuals(self.module, type_actuals));
-                for  field_temp in fields.iter() {
+                for field_temp in fields.iter() {
                     if !fields_str.is_empty() {
                         fields_str.push_str(", ");
                     }
-                    fields_str.push_str(&format!("contents#Memory(m)[old_size+{}]", field_temp));
-                    res_vec.push(self.format_type_checking(
-                        format!("contents#Memory(m)[old_size+{}]", field_temp),
+                    fields_str.push_str(&format!("GetLocal(m, old_size + {})", field_temp));
+                    res_vec.push(format_type_checking(self.module,
+                        format!("GetLocal(m, old_size + {})", field_temp),
                         &self.get_local_type(*field_temp, func_idx),
                     ));
                 }
                 res_vec.push(format!("call tmp := Pack_{}({});", struct_str, fields_str));
-                res_vec.push(format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest));
+                res_vec.push(format!("m := UpdateLocal(m, old_size + {}, tmp);", dest));
                 res_vec
             }
             Unpack(dests, struct_def_index, _, src) => {
@@ -444,20 +516,19 @@ impl<'a> ModuleTranslator<'a> {
                         dests_str.push_str(", ");
                     }
                     dests_str.push_str(&format!("t{}", dest));
-                    dest_type_assumptions.push(self.format_type_checking(
+                    dest_type_assumptions.push(format_type_checking(self.module,
                         format!("t{}", dest),
                         &self.get_local_type(*dest, func_idx),
                     ));
                     if !self.is_local_ref(*dest, func_idx) {
-                        tmp_assignments.push(
-                            format!(
-                                "m := Memory(domain#Memory(m)[old_size+{} := true], contents#Memory(m)[old_size+{} := t{}]);",
-                                dest, dest, dest));
-                            // format!("contents#Memory(m)[old_size+{}] := t{};", dest, dest));
+                        tmp_assignments.push(format!(
+                            "m := UpdateLocal(m, old_size + {}, t{});",
+                            dest, dest
+                        ));
                     }
                 }
                 let mut res_vec = vec![format!(
-                    "call {} := Unpack_{}(contents#Memory(m)[old_size+{}]);",
+                    "call {} := Unpack_{}(GetLocal(m, old_size + {}));",
                     dests_str, struct_str, src
                 )];
                 res_vec.extend(dest_type_assumptions);
@@ -472,39 +543,58 @@ impl<'a> ModuleTranslator<'a> {
                 )]
             }
             Exists(dest, addr, struct_def_index, type_actuals) => {
-                let resource_type = format_struct_type_value_from_def_idx(self.module, struct_def_index, type_actuals);
+                let resource_type = format_struct_type_value_from_def_idx(
+                    self.module,
+                    struct_def_index,
+                    type_actuals,
+                );
                 vec![
-                    format!("call tmp := Exists(contents#Memory(m)[old_size+{}], {});", addr, resource_type),
-                    format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                    format!(
+                        "call tmp := Exists(GetLocal(m, old_size + {}), {});",
+                        addr, resource_type
+                    ),
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
                 ]
             }
             BorrowGlobal(dest, addr, struct_def_index, type_actuals) => {
-                let resource_type = format_struct_type_value_from_def_idx(self.module, struct_def_index, type_actuals);
+                let resource_type = format_struct_type_value_from_def_idx(
+                    self.module,
+                    struct_def_index,
+                    type_actuals,
+                );
                 vec![format!(
-                    "call t{} := BorrowGlobal(contents#Memory(m)[old_size+{}], {});",
+                    "call t{} := BorrowGlobal(GetLocal(m, old_size + {}), {});",
                     dest, addr, resource_type,
-                )]
+                ), propagate_abort]
             }
             MoveToSender(src, struct_def_index, type_actuals) => {
-                let resource_type = format_struct_type_value_from_def_idx(self.module, struct_def_index, type_actuals);
+                let resource_type = format_struct_type_value_from_def_idx(
+                    self.module,
+                    struct_def_index,
+                    type_actuals,
+                );
                 vec![format!(
-                    "call MoveToSender({}, contents#Memory(m)[old_size+{}]);",
+                    "call MoveToSender({}, GetLocal(m, old_size + {}));",
                     resource_type, src,
-                )]
+                ), propagate_abort]
             }
             MoveFrom(dest, src, struct_def_index, type_actuals) => {
-                let resource_type = format_struct_type_value_from_def_idx(self.module, struct_def_index, type_actuals);
-                // DO NOT SUBMIT let struct_str = self.struct_name_from_definition_index(*struct_def_index);
+                let resource_type = format_struct_type_value_from_def_idx(
+                    self.module,
+                    struct_def_index,
+                    type_actuals,
+                );
                 vec![
                     format!(
-                        "call tmp := MoveFrom(contents#Memory(m)[old_size+{}], {});",
+                        "call tmp := MoveFrom(GetLocal(m, old_size + {}), {});",
                         src, resource_type,
                     ),
-                    format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
-                    self.format_type_checking(
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
+                    format_type_checking(self.module,
                         format!("t{}", dest),
                         &self.get_local_type(*dest, func_idx),
                     ),
+                    propagate_abort
                 ]
             }
             Ret(rets) => {
@@ -513,7 +603,7 @@ impl<'a> ModuleTranslator<'a> {
                     if self.is_local_ref(*r, func_idx) {
                         ret_assignments.push(format!("ret{} := t{};", i, r));
                     } else {
-                        ret_assignments.push(format!("ret{} := contents#Memory(m)[old_size+{}];", i, r));
+                        ret_assignments.push(format!("ret{} := GetLocal(m, old_size + {});", i, r));
                     }
                 }
                 ret_assignments.push("return;".to_string());
@@ -521,156 +611,162 @@ impl<'a> ModuleTranslator<'a> {
             }
             LdTrue(idx) => vec![
                 "call tmp := LdTrue();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
             LdFalse(idx) => vec![
                 "call tmp := LdFalse();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
-            LdConst(idx, num) => vec![
+            LdU8(_, _) => unimplemented!(),
+            LdU64(idx, num) => vec![
                 format!("call tmp := LdConst({});", num),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
+            LdU128(_, _) => unimplemented!(),
+            CastU8(_, _) => unimplemented!(),
+            CastU64(_, _) => unimplemented!(),
+            CastU128(_, _) => unimplemented!(),
             LdAddr(idx, addr_idx) => {
                 let addr = self.module.address_pool()[(*addr_idx).into_index()];
                 let addr_int = BigInt::from_str_radix(&addr.to_string(), 16).unwrap();
                 vec![
                     format!("call tmp := LdAddr({});", addr_int),
-                    format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
                 ]
             }
             Not(dest, operand) => vec![
-                format!("call tmp := Not(contents#Memory(m)[old_size+{}]);", operand),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format!("call tmp := Not(GetLocal(m, old_size + {}));", operand),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Add(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Add(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Add(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                propagate_abort,
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Sub(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Sub(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Sub(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                propagate_abort,
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Mul(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Mul(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Mul(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                propagate_abort,
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Div(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Div(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Div(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                propagate_abort,
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Mod(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Mod(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Mod(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                propagate_abort,
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Lt(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Lt(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Lt(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Gt(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Gt(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Gt(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Le(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Le(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Le(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Ge(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Ge(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Ge(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Or(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := Or(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := Or(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             And(dest, op1, op2) => vec![
                 format!(
-                    "call tmp := And(contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]);",
+                    "call tmp := And(GetLocal(m, old_size + {}), GetLocal(m, old_size + {}));",
                     op1, op2
                 ),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
             ],
             Eq(dest, op1, op2) => {
-                let sig = &self.get_local_type(*op1, func_idx);
                 vec![
                     format!(
-                        "tmp := Boolean(is_equal({}, contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]));",
-                        format_type_value(self.module, sig),
+                        "tmp := Boolean(IsEqual(GetLocal(m, old_size + {}), GetLocal(m, old_size + {})));",
                         op1,
                         op2
                     ),
-                    format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
                 ]
             }
             Neq(dest, op1, op2) => {
-                let sig = &self.get_local_type(*op1, func_idx);
                 vec![
                     format!(
-                        "tmp := Boolean(!is_equal({}, contents#Memory(m)[old_size+{}], contents#Memory(m)[old_size+{}]));",
-                        format_type_value(self.module, sig),
+                        "tmp := Boolean(!IsEqual(GetLocal(m, old_size + {}), GetLocal(m, old_size + {})));",
                         op1,
                         op2
                     ),
-                    format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", dest, dest),
+                    format!("m := UpdateLocal(m, old_size + {}, tmp);", dest),
                 ]
             }
             BitOr(_, _, _) | BitAnd(_, _, _) | Xor(_, _, _) => {
                 vec!["// bit operation not supported".into()]
             }
-            Abort(_) => vec!["assert false;".into()],
+            Abort(_) => vec!["goto Label_Abort;".into()],
             GetGasRemaining(idx) => vec![
                 "call tmp := GetGasRemaining();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
             GetTxnSequenceNumber(idx) => vec![
                 "call tmp := GetTxnSequenceNumber();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
             GetTxnPublicKey(idx) => vec![
                 "call tmp := GetTxnPublicKey();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
             GetTxnSenderAddress(idx) => vec![
                 "call tmp := GetTxnSenderAddress();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
             GetTxnMaxGasUnits(idx) => vec![
                 "call tmp := GetTxnMaxGasUnits();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
             GetTxnGasUnitPrice(idx) => vec![
                 "call tmp := GetTxnGasUnitPrice();".to_string(),
-                format!("m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size := tmp]);", idx, idx),
+                format!("m := UpdateLocal(m, old_size + {}, tmp);", idx),
             ],
             _ => vec!["// unimplemented instruction".into()],
         };
@@ -683,8 +779,8 @@ impl<'a> ModuleTranslator<'a> {
 
     // return a string for a boogie procedure header.
     // if inline = true, add the inline attribute and use the plain function name
-    // for the procedure name.
-    // else, generate the function signature without the ":inlne" attribute, and
+    // for the procedure name. Also inject pre/post conditions if defined.
+    // Else, generate the function signature without the ":inline" attribute, and
     // append _verify to the function name.
     pub fn generate_function_sig(
         &self,
@@ -730,7 +826,7 @@ impl<'a> ModuleTranslator<'a> {
         if inline {
             format!(
                 "procedure {{:inline 1}} {} ({}) returns ({})",
-                fun_name, args, rets
+                fun_name, args, rets,
             )
         } else {
             format!(
@@ -738,6 +834,15 @@ impl<'a> ModuleTranslator<'a> {
                 fun_name, args, rets
             )
         }
+    }
+
+    // Return string for the function specification.
+    pub fn generate_function_spec(&self, idx: usize, _arg_names: &Option<Vec<String>>) -> String {
+        let function_info = &self.module_info.function_infos[idx];
+        format!(
+            "\n{}",
+            &SpecTranslator::new(self.parent.modules, self.module, function_info).translate()
+        )
     }
 
     // return string for body of verify function, which is just a call to the
@@ -803,7 +908,7 @@ impl<'a> ModuleTranslator<'a> {
         let function_def = &self.module.function_defs()[idx];
         let code = &self.stackless_bytecode[idx];
 
-        var_decls.push_str("\n{\n");
+        var_decls.push_str("{\n");
         var_decls.push_str("    // declare local variables\n");
 
         let fun_name = self.function_name_from_definition_index(idx);
@@ -819,8 +924,8 @@ impl<'a> ModuleTranslator<'a> {
             if i < num_args {
                 if !self.is_local_ref(i, idx) {
                     arg_assignment_str.push_str(&format!(
-                        "    m := Memory(domain#Memory(m)[{}+old_size := true], contents#Memory(m)[{}+old_size :=  {}]);\n",
-                        i, i,
+                        "    m := UpdateLocal(m, old_size + {}, {});\n",
+                        i,
                         self.get_arg_name(i, arg_names)
                     ));
                 } else {
@@ -833,7 +938,7 @@ impl<'a> ModuleTranslator<'a> {
 
                 arg_value_assumption_str.push_str(&format!(
                     "    {}",
-                    self.format_type_checking(self.get_arg_name(i, arg_names), local_type)
+                    format_type_checking(self.module, self.get_arg_name(i, arg_names), local_type)
                 ));
                 if self.dbg_args_enabled(&fun_name) {
                     var_decls.push_str(&format!(
@@ -862,14 +967,14 @@ impl<'a> ModuleTranslator<'a> {
         }
         var_decls.push_str("\n    var tmp: Value;\n");
         var_decls.push_str("    var old_size: int;\n");
-        //        if !inline {
+        res.push_str("\n    var saved_m: Memory;\n");
         res.push_str("    assume !abort_flag;\n");
-        //        }
+        res.push_str("    saved_m := m;\n");
         res.push_str("\n    // assume arguments are of correct types\n");
         res.push_str(&arg_value_assumption_str);
-        res.push_str("\n    old_size := m_size;\n");
+        res.push_str("\n    old_size := local_counter;\n");
         res.push_str(&format!(
-            "    m_size := m_size + {};\n",
+            "    local_counter := local_counter + {};\n",
             code.local_types.len()
         ));
         res.push_str(&arg_assignment_str);
@@ -902,6 +1007,16 @@ impl<'a> ModuleTranslator<'a> {
                 self.translate_bytecode(offset, bytecode, idx, arg_names);
             var_decls.push_str(&new_var_decls);
             res.push_str(&new_res);
+        }
+        res.push_str("Label_Abort:\n");
+        res.push_str("    abort_flag := true;\n");
+        res.push_str("    m := saved_m;\n");
+        for (i, sig) in get_return_types(self.module, idx).iter().enumerate() {
+            if let SignatureToken::Reference(_) = sig {
+                res.push_str(&format!("    ret{} := DefaultReference;\n", i));
+            } else {
+                res.push_str(&format!("    ret{} := DefaultValue;\n", i));
+            }
         }
         res.push_str("}\n");
         var_decls.push_str(&res);
@@ -1012,17 +1127,27 @@ impl<'a> ModuleTranslator<'a> {
         }
         .into()
     }
+}
 
-    pub fn format_type_checking(&self, name: String, sig: &SignatureToken) -> String {
-        match sig {
-            // Reference does not require type checking
-            SignatureToken::Reference(_) | SignatureToken::MutableReference(_) => "".to_string(),
-            sig => format!(
-                "assume has_type({}, {});\n",
-                format_type_value(self.module, sig),
-                name
-            ),
-        }
+pub fn format_type_checking(
+    _module: &VerifiedModule,
+    name: String,
+    sig: &SignatureToken,
+) -> String {
+    let check = match sig {
+        SignatureToken::U64 => "is#Integer",
+        SignatureToken::Bool => "is#Boolean",
+        SignatureToken::Address => "is#Address",
+        SignatureToken::ByteArray => "is#ByteArray",
+        // Only need to check Struct for top-level; fields will be checked as we extract them.
+        SignatureToken::Struct(_, _) => "is#Vector",
+        // Otherwise it is a reference or a type parameter. Will be checked when accessed.
+        _ => "",
+    };
+    if check.is_empty() {
+        "".to_string()
+    } else {
+        format!("assume {}({});\n", check, name)
     }
 }
 
@@ -1032,6 +1157,12 @@ pub fn struct_name_from_handle_index(module: &VerifiedModule, idx: StructHandleI
     let module_name = module.identifier_at(struct_handle_view.module_handle().name);
     let struct_name = struct_handle_view.name();
     format!("{}_{}", module_name, struct_name)
+}
+
+pub fn module_name(module: &VerifiedModule) -> Identifier {
+    module
+        .identifier_at(module.module_handle_at(ModuleHandleIndex::new(0)).name)
+        .into()
 }
 
 pub fn struct_type_arity_from_handle_index(
@@ -1055,8 +1186,9 @@ pub fn is_struct_vector(module: &VerifiedModule, idx: StructHandleIndex) -> bool
 pub fn format_type(module: &VerifiedModule, sig: &SignatureToken) -> String {
     match sig {
         SignatureToken::Bool => "bool".into(),
+        SignatureToken::U8 => unimplemented!(),
         SignatureToken::U64 => "int".into(),
-        SignatureToken::String => "string".into(),
+        SignatureToken::U128 => unimplemented!(),
         SignatureToken::ByteArray => "bytearray".into(),
         SignatureToken::Address => "address".into(),
         SignatureToken::Struct(idx, _) => struct_name_from_handle_index(module, *idx),
@@ -1074,8 +1206,9 @@ pub fn format_type(module: &VerifiedModule, sig: &SignatureToken) -> String {
 pub fn format_type_value(module: &VerifiedModule, sig: &SignatureToken) -> String {
     match sig {
         SignatureToken::Bool => "BooleanType()".to_string(),
+        SignatureToken::U8 => unimplemented!(),
         SignatureToken::U64 => "IntegerType()".to_string(),
-        SignatureToken::String => "StrType()".to_string(),
+        SignatureToken::U128 => unimplemented!(),
         SignatureToken::ByteArray => "ByteArrayType()".to_string(),
         SignatureToken::Address => "AddressType()".to_string(),
         SignatureToken::Reference(t) | SignatureToken::MutableReference(t) => {
@@ -1152,4 +1285,12 @@ pub fn get_field_infos(
             })
             .collect()
     }
+}
+
+/// Get return types of function via definition index.
+pub fn get_return_types(module: &VerifiedModule, idx: usize) -> &[SignatureToken] {
+    let function_def = &module.function_defs()[idx];
+    let function_handle = module.function_handle_at(function_def.function);
+    let function_signature = module.function_signature_at(function_handle.signature);
+    &function_signature.return_types
 }

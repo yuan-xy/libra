@@ -8,13 +8,13 @@ use lcs;
 use vm::{
     file_format::{
         AddressPoolIndex, ByteArrayPoolIndex, Bytecode, FieldDefinitionIndex, FunctionHandleIndex,
-        StructDefinitionIndex, UserStringIndex, NO_TYPE_ACTUALS, NUMBER_OF_NATIVE_FUNCTIONS,
+        StructDefinitionIndex, NO_TYPE_ACTUALS, NUMBER_OF_NATIVE_FUNCTIONS,
     },
     gas_schedule::{CostTable, GasCost, GAS_SCHEDULE_NAME, MAXIMUM_NUMBER_OF_GAS_UNITS},
 };
 use vm_runtime::{
-    data_cache::RemoteCache, execution_context::TransactionExecutionContext,
-    gas_meter::GAS_SCHEDULE_MODULE, runtime::VMRuntime,
+    chain_state::TransactionExecutionContext, data_cache::RemoteCache, runtime::VMRuntime,
+    system_module_names::GAS_SCHEDULE_MODULE,
 };
 use vm_runtime_types::value::Value;
 
@@ -54,14 +54,20 @@ lazy_static! {
             (StLoc(0), GasCost::new(28, 1)),
             (Ret, GasCost::new(28, 1)),
             (Lt, GasCost::new(49, 1)),
-            (LdConst(0), GasCost::new(29, 1)),
+            (LdU8(0), GasCost::new(29, 1)),
+            (LdU64(0), GasCost::new(29, 1)),
+            (LdU128(0), GasCost::new(29, 1)),
+            (CastU8, GasCost::new(29, 1)),
+            (CastU64, GasCost::new(29, 1)),
+            (CastU128, GasCost::new(29, 1)),
             (Abort, GasCost::new(39, 1)),
             (MutBorrowLoc(0), GasCost::new(45, 1)),
             (ImmBorrowLoc(0), GasCost::new(45, 1)),
-            (LdStr(UserStringIndex::new(0)), GasCost::new(52, 1)),
             (LdAddr(AddressPoolIndex::new(0)), GasCost::new(36, 1)),
             (Ge, GasCost::new(46, 1)),
             (Xor, GasCost::new(46, 1)),
+            (Shl, GasCost::new(46, 1)),
+            (Shr, GasCost::new(46, 1)),
             (Neq, GasCost::new(51, 1)),
             (Not, GasCost::new(35, 1)),
             (

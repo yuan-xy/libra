@@ -2,17 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{ensure, format_err, Result};
-use config_builder::util::get_test_config;
+use config_builder;
 use executor::{ExecutedTrees, Executor};
 use grpc_helpers::ServerHandle;
 use grpcio::EnvBuilder;
 use libra_config::config::{NodeConfig, VMConfig, VMPublishingOption};
-use libra_crypto::{ed25519::*, hash::GENESIS_BLOCK_ID, test_utils::TEST_SEED, HashValue};
+use libra_crypto::{
+    ed25519::*, hash::GENESIS_BLOCK_ID, test_utils::TEST_SEED, HashValue, PrivateKey,
+};
 use libra_types::crypto_proxies::EpochInfo;
+use libra_types::validator_change::VerifierType;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::{association_address, get_account_resource_or_default},
+    account_config::{association_address, AccountResource},
     account_state_blob::AccountStateWithProof,
     block_info::BlockInfo,
     block_metadata::BlockMetadata,
@@ -23,9 +26,10 @@ use libra_types::{
     transaction::{Script, Transaction, TransactionListWithProof, TransactionWithProof},
 };
 use rand::SeedableRng;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, convert::TryFrom, sync::Arc};
 use storage_client::{StorageRead, StorageReadServiceClient, StorageWriteServiceClient};
 use storage_service::start_storage_service;
+use tokio::runtime::Runtime;
 use transaction_builder::{
     encode_block_prologue_script, encode_create_account_script,
     encode_rotate_consensus_pubkey_script, encode_transfer_script,
@@ -55,6 +59,7 @@ fn gen_block_metadata(index: u8, proposer: AccountAddress) -> BlockMetadata {
 fn create_storage_service_and_executor(
     config: &NodeConfig,
 ) -> (ServerHandle, Executor<LibraVM>, ExecutedTrees) {
+    let mut rt = Runtime::new().unwrap();
     let storage_server_handle = start_storage_service(config);
 
     let client_env = Arc::new(EnvBuilder::new().build());
@@ -76,8 +81,8 @@ fn create_storage_service_and_executor(
         config,
     );
 
-    let startup_info = storage_read_client
-        .get_startup_info()
+    let startup_info = rt
+        .block_on(storage_read_client.get_startup_info_async())
         .expect("unable to read ledger info from storage")
         .expect("startup info is None");
     let committed_trees = ExecutedTrees::from(startup_info.committed_tree_state);
@@ -105,7 +110,7 @@ fn test_reconfiguration() {
     // When executing a transaction emits a validator set change, storage should propagate the new
     // validator set
 
-    let (mut config, genesis_keypair) = get_test_config();
+    let (mut config, genesis_key) = config_builder::test_config();
     config.vm_config = VMConfig {
         publishing_options: VMPublishingOption::CustomScripts,
     };
@@ -129,8 +134,8 @@ fn test_reconfiguration() {
     let txn1 = get_test_signed_transaction(
         genesis_account,
         /* sequence_number = */ 1,
-        genesis_keypair.private_key.clone(),
-        genesis_keypair.public_key.clone(),
+        genesis_key.clone(),
+        genesis_key.public_key(),
         Some(encode_transfer_script(&validator_account, 200_000)),
     );
     // rotate the validator's connsensus pubkey to trigger a reconfiguration
@@ -199,7 +204,8 @@ fn test_reconfiguration() {
 
 #[test]
 fn test_execution_with_storage() {
-    let (config, genesis_keypair) = get_test_config();
+    let mut rt = Runtime::new().unwrap();
+    let (config, genesis_key) = config_builder::test_config();
     let (_storage_server_handle, executor, mut committed_trees) =
         create_storage_service_and_executor(&config);
 
@@ -227,8 +233,8 @@ fn test_execution_with_storage() {
     let txn1 = get_test_signed_transaction(
         genesis_account,
         /* sequence_number = */ 1,
-        genesis_keypair.private_key.clone(),
-        genesis_keypair.public_key.clone(),
+        genesis_key.clone(),
+        genesis_key.public_key(),
         Some(encode_create_account_script(&account1, 2_000_000)),
     );
 
@@ -236,8 +242,8 @@ fn test_execution_with_storage() {
     let txn2 = get_test_signed_transaction(
         genesis_account,
         /* sequence_number = */ 2,
-        genesis_keypair.private_key.clone(),
-        genesis_keypair.public_key.clone(),
+        genesis_key.clone(),
+        genesis_key.public_key(),
         Some(encode_create_account_script(&account2, 200_000)),
     );
 
@@ -245,8 +251,8 @@ fn test_execution_with_storage() {
     let txn3 = get_test_signed_transaction(
         genesis_account,
         /* sequence_number = */ 3,
-        genesis_keypair.private_key.clone(),
-        genesis_keypair.public_key.clone(),
+        genesis_key.clone(),
+        genesis_key.public_key(),
         Some(encode_create_account_script(&account3, 100_000)),
     );
 
@@ -402,21 +408,24 @@ fn test_execution_with_storage() {
     let (
         mut response_items,
         ledger_info_with_sigs,
-        validator_change_events,
+        validator_change_proof,
         _ledger_consistency_proof,
-    ) = storage_read_client
-        .update_to_latest_ledger(/* client_known_version = */ 0, request_items.clone())
+    ) = rt
+        .block_on(storage_read_client.update_to_latest_ledger_async(
+            /* client_known_version = */ 0,
+            request_items.clone(),
+        ))
         .unwrap();
     verify_update_to_latest_ledger_response(
-        &mut EpochInfo {
+        &VerifierType::TrustedVerifier(EpochInfo {
             epoch: 0,
-            verifier: ValidatorVerifier::new(BTreeMap::new()),
-        },
+            verifier: Arc::new(ValidatorVerifier::new(BTreeMap::new())),
+        }),
         0,
         &request_items,
         &response_items,
         &ledger_info_with_sigs,
-        &validator_change_events,
+        &validator_change_proof,
     )
     .unwrap();
     response_items.reverse();
@@ -612,21 +621,24 @@ fn test_execution_with_storage() {
     let (
         mut response_items,
         ledger_info_with_sigs,
-        validator_change_events,
+        validator_change_proof,
         _ledger_consistency_proof,
-    ) = storage_read_client
-        .update_to_latest_ledger(/* client_known_version = */ 0, request_items.clone())
+    ) = rt
+        .block_on(storage_read_client.update_to_latest_ledger_async(
+            /* client_known_version = */ 0,
+            request_items.clone(),
+        ))
         .unwrap();
     verify_update_to_latest_ledger_response(
-        &mut EpochInfo {
+        &&VerifierType::TrustedVerifier(EpochInfo {
             epoch: 0,
-            verifier: ValidatorVerifier::new(BTreeMap::new()),
-        },
+            verifier: Arc::new(ValidatorVerifier::new(BTreeMap::new())),
+        }),
         0,
         &request_items,
         &response_items,
         &ledger_info_with_sigs,
-        &validator_change_events,
+        &validator_change_proof,
     )
     .unwrap();
     response_items.reverse();
@@ -707,7 +719,11 @@ fn verify_account_balance<F>(account_state_with_proof: &AccountStateWithProof, f
 where
     F: Fn(u64) -> bool,
 {
-    let balance = get_account_resource_or_default(&account_state_with_proof.blob)?.balance();
+    let balance = if let Some(blob) = &account_state_with_proof.blob {
+        AccountResource::try_from(blob)?.balance()
+    } else {
+        0
+    };
     ensure!(
         f(balance),
         "balance {} doesn't satisfy the condition passed in",
@@ -763,8 +779,11 @@ fn verify_uncommitted_txn_status(
         "proof_of_current_sequence_number should be provided when transaction is not committed."
     )
     })?;
-    let seq_num_in_account =
-        get_account_resource_or_default(&proof_of_current_sequence_number.blob)?.sequence_number();
+    let seq_num_in_account = if let Some(blob) = &proof_of_current_sequence_number.blob {
+        AccountResource::try_from(blob)?.sequence_number()
+    } else {
+        0
+    };
 
     ensure!(
         expected_seq_num == seq_num_in_account,

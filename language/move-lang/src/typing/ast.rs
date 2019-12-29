@@ -32,7 +32,10 @@ pub struct Program {
 
 #[derive(Debug)]
 pub struct ModuleDefinition {
-    pub is_source_module: bool,
+    /// `None` if it is a library dependency
+    /// `Some(order)` if it is a source file. Where `order` is the topological order/rank in the
+    /// depedency graph
+    pub is_source_module: Option<usize>,
     pub structs: UniqueMap<StructName, StructDefinition>,
     pub functions: UniqueMap<FunctionName, Function>,
 }
@@ -128,7 +131,6 @@ pub enum BuiltinFunction_ {
      * GetPublicKey,
      * GetSender,
      * GetSequenceNumber,
-     * GetGasRemaining,
      * EmitEvent, */
 }
 pub type BuiltinFunction = Spanned<BuiltinFunction_>;

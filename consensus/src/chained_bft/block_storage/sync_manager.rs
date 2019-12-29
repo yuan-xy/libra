@@ -18,7 +18,7 @@ use consensus_types::{
 };
 use libra_logger::prelude::*;
 use libra_types::account_address::AccountAddress;
-use libra_types::validator_change::ValidatorChangeEventWithProof;
+use libra_types::validator_change::ValidatorChangeProof;
 use mirai_annotations::checked_precondition;
 use rand::{prelude::*, Rng};
 use std::{
@@ -163,9 +163,10 @@ impl<T: Payload> BlockStore<T> {
             .save_tree(blocks.clone(), quorum_certs.clone())?;
         let pre_sync_instance = Instant::now();
         self.state_computer
-            .sync_to_or_bail(highest_commit_cert.ledger_info().clone());
+            .sync_to(highest_commit_cert.ledger_info().clone())
+            .await?;
         counters::STATE_SYNC_DURATION_S.observe_duration(pre_sync_instance.elapsed());
-        let (root, root_executed_trees, blocks, quorum_certs) = self.storage.start().take();
+        let (root, root_executed_trees, blocks, quorum_certs) = self.storage.start().await.take();
         debug!("{}Sync to{} {}", Fg(Blue), Fg(Reset), root.0);
         self.rebuild(root, root_executed_trees, blocks, quorum_certs)
             .await;
@@ -173,9 +174,10 @@ impl<T: Payload> BlockStore<T> {
         if highest_commit_cert.ends_epoch() {
             retriever
                 .network
-                .notify_epoch_change(ValidatorChangeEventWithProof::new(vec![
-                    highest_commit_cert.ledger_info().clone(),
-                ]))
+                .notify_epoch_change(ValidatorChangeProof::new(
+                    vec![highest_commit_cert.ledger_info().clone()],
+                    /* more = */ false,
+                ))
                 .await;
         }
         Ok(())

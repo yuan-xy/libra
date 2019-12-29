@@ -194,10 +194,12 @@ pub fn program(prog: G::Program) -> std::result::Result<Vec<CompiledUnit>, Error
         })
         .collect();
 
-    let source_modules = prog
+    let mut source_modules = prog
         .modules
         .into_iter()
-        .filter(|(_, mdef)| mdef.is_source_module);
+        .filter(|(_, mdef)| mdef.is_source_module.is_some())
+        .collect::<Vec<_>>();
+    source_modules.sort_by_key(|(_, mdef)| mdef.is_source_module.unwrap());
     for (m, mdef) in source_modules {
         match module(m, mdef, &sdecls, &fdecls) {
             Ok((n, cm)) => units.push(CompiledUnit::Module(n, cm)),
@@ -252,7 +254,6 @@ fn module(
         function_signatures,
         locals_signatures,
         identifiers,
-        user_strings,
         byte_array_pool,
         address_pool,
     } = context.materialize_pools();
@@ -264,7 +265,6 @@ fn module(
         function_signatures,
         locals_signatures,
         identifiers,
-        user_strings,
         byte_array_pool,
         address_pool,
         struct_defs,
@@ -302,7 +302,6 @@ fn main(
         function_signatures,
         locals_signatures,
         identifiers,
-        user_strings,
         byte_array_pool,
         address_pool,
     } = context.materialize_pools();
@@ -314,7 +313,6 @@ fn main(
         function_signatures,
         locals_signatures,
         identifiers,
-        user_strings,
         byte_array_pool,
         address_pool,
         main,
@@ -782,7 +780,7 @@ fn exp_(
                     let idx = context.byte_array_index(eloc, bytes)?;
                     B::LdByteArray(idx)
                 }
-                V::U64(u) => B::LdConst(u),
+                V::U64(u) => B::LdU64(u),
                 V::Bool(b) => {
                     if b {
                         B::LdTrue
@@ -924,7 +922,6 @@ fn call(
     match (&m.0.value.address, m.0.value.name.value(), f.value()) {
         (&A::LIBRA_CORE, TXN::MOD, TXN::GAS_PRICE) => code.push(B::GetTxnGasUnitPrice),
         (&A::LIBRA_CORE, TXN::MOD, TXN::MAX_GAS) => code.push(B::GetTxnMaxGasUnits),
-        (&A::LIBRA_CORE, TXN::MOD, TXN::GAS_REMAINING) => code.push(B::GetGasRemaining),
         (&A::LIBRA_CORE, TXN::MOD, TXN::SENDER) => code.push(B::GetTxnSenderAddress),
         (&A::LIBRA_CORE, TXN::MOD, TXN::SEQUENCE_NUM) => code.push(B::GetTxnSequenceNumber),
         (&A::LIBRA_CORE, TXN::MOD, TXN::PUBLIC_KEY) => code.push(B::GetTxnPublicKey),

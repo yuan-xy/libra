@@ -27,8 +27,8 @@
 //! those structs translate to tables and table specifications.
 
 use crate::{
-    access::ModuleAccess, check_bounds::BoundsChecker, internals::ModuleIndex, vm_string::VMString,
-    IndexKind, SignatureTokenKind,
+    access::ModuleAccess, check_bounds::BoundsChecker, internals::ModuleIndex, IndexKind,
+    SignatureTokenKind,
 };
 use lazy_static::lazy_static;
 use libra_types::{
@@ -110,11 +110,6 @@ define_index! {
     doc: "Index into the `Identifier` table.",
 }
 define_index! {
-    name: UserStringIndex,
-    kind: UserString,
-    doc: "Index into the `UserString` (VM string) table.",
-}
-define_index! {
     name: ByteArrayPoolIndex,
     kind: ByteArrayPool,
     doc: "Index into the `ByteArrayPool` table.",
@@ -167,8 +162,6 @@ pub type CodeOffset = u16;
 
 /// The pool of identifiers.
 pub type IdentifierPool = Vec<Identifier>;
-/// The pool of string literals.
-pub type UserStringPool = Vec<VMString>;
 /// The pool of `ByteArray` literals.
 pub type ByteArrayPool = Vec<ByteArray>;
 /// The pool of `AccountAddress` literals.
@@ -500,10 +493,12 @@ impl Kind {
 pub enum SignatureToken {
     /// Boolean, `true` or `false`.
     Bool,
+    /// Unsigned integers, 8 bits length.
+    U8,
     /// Unsigned integers, 64 bits length.
     U64,
-    /// Strings, immutable, utf8 representation.
-    String,
+    /// Unsigned integers, 128 bits length.
+    U128,
     /// ByteArray, variable size, immutable byte array.
     ByteArray,
     /// Address, a 32 bytes immutable type.
@@ -530,7 +525,6 @@ impl Arbitrary for SignatureToken {
         let leaf = prop_oneof![
             Just(Bool),
             Just(U64),
-            Just(String),
             Just(ByteArray),
             Just(Address),
             // TODO: generate type actuals when generics is implemented
@@ -558,8 +552,9 @@ impl ::std::fmt::Debug for SignatureToken {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
         match self {
             SignatureToken::Bool => write!(f, "Bool"),
+            SignatureToken::U8 => write!(f, "U8"),
             SignatureToken::U64 => write!(f, "U64"),
-            SignatureToken::String => write!(f, "String"),
+            SignatureToken::U128 => write!(f, "U128"),
             SignatureToken::ByteArray => write!(f, "ByteArray"),
             SignatureToken::Address => write!(f, "Address"),
             SignatureToken::Struct(idx, types) => write!(f, "Struct({:?}, {:?})", idx, types),
@@ -613,7 +608,9 @@ impl SignatureToken {
         match self {
             Reference(_) => SignatureTokenKind::Reference,
             MutableReference(_) => SignatureTokenKind::MutableReference,
-            Bool | U64 | ByteArray | String | Address | Struct(_, _) => SignatureTokenKind::Value,
+            Bool | U8 | U64 | U128 | ByteArray | Address | Struct(_, _) => {
+                SignatureTokenKind::Value
+            }
             // TODO: This is a temporary hack to please the verifier. SignatureTokenKind will soon
             // be completely removed. `SignatureTokenView::kind()` should be used instead.
             TypeParameter(_) => SignatureTokenKind::Value,
@@ -629,7 +626,7 @@ impl SignatureToken {
         match self {
             Struct(sh_idx, _) => Some(*sh_idx),
             Reference(token) | MutableReference(token) => token.struct_index(),
-            Bool | U64 | ByteArray | String | Address | TypeParameter(_) => None,
+            Bool | U8 | U64 | U128 | ByteArray | Address | TypeParameter(_) => None,
         }
     }
 
@@ -637,8 +634,23 @@ impl SignatureToken {
     pub fn is_primitive(&self) -> bool {
         use SignatureToken::*;
         match self {
-            Bool | U64 | String | ByteArray | Address => true,
+            Bool | U8 | U64 | U128 | ByteArray | Address => true,
             Struct(_, _) | Reference(_) | MutableReference(_) | TypeParameter(_) => false,
+        }
+    }
+
+    // Returns `true` if the `SignatureToken` is an integer type.
+    pub fn is_integer(&self) -> bool {
+        use SignatureToken::*;
+        match self {
+            U8 | U64 | U128 => true,
+            Bool
+            | ByteArray
+            | Address
+            | Struct(_, _)
+            | Reference(_)
+            | MutableReference(_)
+            | TypeParameter(_) => false,
         }
     }
 
@@ -647,7 +659,6 @@ impl SignatureToken {
     /// Currently equality operations are only allowed on:
     /// - Bool
     /// - U64
-    /// - String
     /// - ByteArray
     /// - Address
     /// - Reference or Mutable reference to these types
@@ -701,8 +712,9 @@ impl SignatureToken {
 
         match self {
             Bool => Bool,
+            U8 => U8,
             U64 => U64,
-            String => String,
+            U128 => U128,
             ByteArray => ByteArray,
             Address => Address,
             Struct(idx, actuals) => Struct(
@@ -728,7 +740,7 @@ impl SignatureToken {
 
         match ty {
             // The primitive types & references have kind unrestricted.
-            Bool | U64 | String | ByteArray | Address | Reference(_) | MutableReference(_) => {
+            Bool | U8 | U64 | U128 | ByteArray | Address | Reference(_) | MutableReference(_) => {
                 Kind::Unrestricted
             }
 
@@ -750,13 +762,13 @@ impl SignatureToken {
                     .collect::<Vec<_>>();
 
                 // Derive the kind of the struct.
-                //   - If any of the type actuals has kind `all`, then the struct has kind `all`.
+                //   - If any of the type actuals is `all`, then the struct is `all`.
                 //     - `all` means some part of the type can be either `resource` or
                 //       `unrestricted`.
                 //     - Therefore it is also impossible to determine the kind of the type as a
                 //       whole, and thus `all`.
-                //   - If none of the type actuals has kind `all`, then the struct is a resource if
-                //     and only if one of the type actuals has kind `resource`.
+                //   - If none of the type actuals is `all`, then the struct is a resource if
+                //     and only if one of the type actuals is `resource`.
                 kinds.iter().fold(Kind::Unrestricted, Kind::join)
             }
         }
@@ -832,19 +844,42 @@ pub enum Bytecode {
     ///
     /// Stack transition: none
     Branch(CodeOffset),
-    /// Push integer constant onto the stack.
+    /// Push a U8 constant onto the stack.
+    ///
+    /// Stack transition:
+    ///
+    /// ```... -> ..., u8_value```
+    LdU8(u8),
+    /// Push a U64 constant onto the stack.
     ///
     /// Stack transition:
     ///
     /// ```... -> ..., u64_value```
-    LdConst(u64),
-    /// Push a string literal onto the stack. The string is loaded from the `UserStrings` via
-    /// `UserStringIndex`.
+    LdU64(u64),
+    /// Push a U128 constant onto the stack.
     ///
     /// Stack transition:
     ///
-    /// ```... -> ..., string_value```
-    LdStr(UserStringIndex),
+    /// ```... -> ..., u128_value```
+    LdU128(u128),
+    /// Convert the value at the top of the stack into u8.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., integer_value -> ..., u8_value```
+    CastU8,
+    /// Convert the value at the top of the stack into u64.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., integer_value -> ..., u8_value```
+    CastU64,
+    /// Convert the value at the top of the stack into u128.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., integer_value -> ..., u128_value```
+    CastU128,
     /// Push a `ByteArray` literal onto the stack. The `ByteArray` is loaded from the
     /// `ByteArrayPool` via `ByteArrayPoolIndex`.
     ///
@@ -1177,12 +1212,24 @@ pub enum Bytecode {
     ///
     /// ```..., -> ..., bytearray_value```
     GetTxnPublicKey,
+    /// Shift the (second top value) left (top value) bits and pushes the result on the stack.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., u64_value(1), u64_value(2) -> ..., u64_value```
+    Shl,
+    /// Shift the (second top value) right (top value) bits and pushes the result on the stack.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., u64_value(1), u64_value(2) -> ..., u64_value```
+    Shr,
 }
 
 /// The number of bytecode instructions.
 /// This is necessary for checking that all instructions are covered since Rust
 /// does not provide a way of determining the number of variants of an enum.
-pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 53;
+pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 59;
 
 pub const NUMBER_OF_NATIVE_FUNCTIONS: usize = 17;
 
@@ -1194,8 +1241,12 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::BrTrue(a) => write!(f, "BrTrue({})", a),
             Bytecode::BrFalse(a) => write!(f, "BrFalse({})", a),
             Bytecode::Branch(a) => write!(f, "Branch({})", a),
-            Bytecode::LdConst(a) => write!(f, "LdConst({})", a),
-            Bytecode::LdStr(a) => write!(f, "LdStr({})", a),
+            Bytecode::LdU8(a) => write!(f, "LdU8({})", a),
+            Bytecode::LdU64(a) => write!(f, "LdU64({})", a),
+            Bytecode::LdU128(a) => write!(f, "LdU128({})", a),
+            Bytecode::CastU8 => write!(f, "CastU8"),
+            Bytecode::CastU64 => write!(f, "CastU64"),
+            Bytecode::CastU128 => write!(f, "CastU128"),
             Bytecode::LdByteArray(a) => write!(f, "LdByteArray({})", a),
             Bytecode::LdAddr(a) => write!(f, "LdAddr({})", a),
             Bytecode::LdTrue => write!(f, "LdTrue"),
@@ -1223,6 +1274,8 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::BitOr => write!(f, "BitOr"),
             Bytecode::BitAnd => write!(f, "BitAnd"),
             Bytecode::Xor => write!(f, "Xor"),
+            Bytecode::Shl => write!(f, "Shl"),
+            Bytecode::Shr => write!(f, "Shr"),
             Bytecode::Or => write!(f, "Or"),
             Bytecode::And => write!(f, "And"),
             Bytecode::Not => write!(f, "Not"),
@@ -1361,8 +1414,6 @@ pub struct CompiledScriptMut {
 
     /// All identifiers used in this transaction.
     pub identifiers: IdentifierPool,
-    /// User strings. All literals used in this transaction.
-    pub user_strings: UserStringPool,
     /// ByteArray pool. The byte array literals used in the transaction.
     pub byte_array_pool: ByteArrayPool,
     /// Address pool. The address literals used in the module. Those include literals for
@@ -1419,7 +1470,6 @@ impl CompiledScriptMut {
             locals_signatures: self.locals_signatures,
 
             identifiers: self.identifiers,
-            user_strings: self.user_strings,
             byte_array_pool: self.byte_array_pool,
             address_pool: self.address_pool,
 
@@ -1461,8 +1511,6 @@ pub struct CompiledModuleMut {
 
     /// All identifiers used in this module.
     pub identifiers: IdentifierPool,
-    /// User strings. All literals used in this module.
-    pub user_strings: UserStringPool,
     /// ByteArray pool. The byte array literals used in the module.
     pub byte_array_pool: ByteArrayPool,
     /// Address pool. The address literals used in the module. Those include literals for
@@ -1499,7 +1547,6 @@ impl Arbitrary for CompiledScriptMut {
             ),
             (
                 vec(any::<Identifier>(), 0..=size),
-                vec(any::<VMString>(), 0..=size),
                 vec(any::<ByteArray>(), 0..=size),
                 vec(any::<AccountAddress>(), 0..=size),
             ),
@@ -1509,7 +1556,7 @@ impl Arbitrary for CompiledScriptMut {
                 |(
                     (module_handles, struct_handles, function_handles),
                     (type_signatures, function_signatures, locals_signatures),
-                    (identifiers, user_strings, byte_array_pool, address_pool),
+                    (identifiers, byte_array_pool, address_pool),
                     main,
                 )| {
                     CompiledScriptMut {
@@ -1520,7 +1567,6 @@ impl Arbitrary for CompiledScriptMut {
                         function_signatures,
                         locals_signatures,
                         identifiers,
-                        user_strings,
                         byte_array_pool,
                         address_pool,
                         main,
@@ -1551,7 +1597,6 @@ impl Arbitrary for CompiledModuleMut {
             ),
             (
                 vec(any::<Identifier>(), 0..=size),
-                vec(any::<VMString>(), 0..=size),
                 vec(any::<ByteArray>(), 0..=size),
                 vec(any::<AccountAddress>(), 0..=size),
             ),
@@ -1565,7 +1610,7 @@ impl Arbitrary for CompiledModuleMut {
                 |(
                     (module_handles, struct_handles, function_handles),
                     (type_signatures, function_signatures, locals_signatures),
-                    (identifiers, user_strings, byte_array_pool, address_pool),
+                    (identifiers, byte_array_pool, address_pool),
                     (struct_defs, field_defs, function_defs),
                 )| {
                     CompiledModuleMut {
@@ -1576,7 +1621,6 @@ impl Arbitrary for CompiledModuleMut {
                         function_signatures,
                         locals_signatures,
                         identifiers,
-                        user_strings,
                         byte_array_pool,
                         address_pool,
                         struct_defs,
@@ -1603,7 +1647,6 @@ impl CompiledModuleMut {
             IndexKind::FunctionSignature => self.function_signatures.len(),
             IndexKind::LocalsSignature => self.locals_signatures.len(),
             IndexKind::Identifier => self.identifiers.len(),
-            IndexKind::UserString => self.user_strings.len(),
             IndexKind::ByteArrayPool => self.byte_array_pool.len(),
             IndexKind::AddressPool => self.address_pool.len(),
             // XXX these two don't seem to belong here
@@ -1676,7 +1719,6 @@ impl CompiledModule {
             locals_signatures: inner.locals_signatures,
 
             identifiers: inner.identifiers,
-            user_strings: inner.user_strings,
             byte_array_pool: inner.byte_array_pool,
             address_pool: inner.address_pool,
 
@@ -1694,7 +1736,6 @@ pub fn empty_module() -> CompiledModuleMut {
         }],
         address_pool: vec![AccountAddress::default()],
         identifiers: vec![self_module_name().to_owned()],
-        user_strings: vec![],
         function_defs: vec![],
         struct_defs: vec![],
         field_defs: vec![],

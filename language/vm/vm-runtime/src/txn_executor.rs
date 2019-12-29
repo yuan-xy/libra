@@ -3,63 +3,23 @@
 //! Processor for a single transaction.
 
 use crate::{
-    counters::*,
-    data_cache::{BlockDataCache, RemoteCache},
-    execution_context::TransactionExecutionContext,
+    chain_state::TransactionExecutionContext, counters::*, data_cache::RemoteCache,
     runtime::VMRuntime,
 };
-use bytecode_verifier::VerifiedModule;
-use libra_config::config::{VMConfig, VMPublishingOption};
 use libra_state_view::StateView;
 use libra_types::{
     account_address::AccountAddress,
-    account_config,
-    identifier::{IdentStr, Identifier},
+    identifier::IdentStr,
     language_storage::ModuleId,
     transaction::{TransactionArgument, TransactionOutput, TransactionStatus},
-    vm_error::{StatusCode, StatusType, VMStatus},
-    write_set::WriteSet,
+    vm_error::{StatusCode, VMStatus},
 };
 use vm::{
-    access::ModuleAccess,
     errors::*,
-    file_format::FunctionDefinitionIndex,
     gas_schedule::{CostTable, GasAlgebra},
     transaction_metadata::TransactionMetadata,
-    vm_string::VMString,
 };
-use vm_cache_map::Arena;
 use vm_runtime_types::value::Value;
-
-pub use crate::gas_meter::GAS_SCHEDULE_MODULE;
-
-// Metadata needed for resolving the account module.
-lazy_static! {
-    /// The ModuleId for the Account module
-    pub static ref ACCOUNT_MODULE: ModuleId =
-        { ModuleId::new(account_config::core_code_address(), Identifier::new("LibraAccount").unwrap()) };
-    /// The ModuleId for the LibraCoin module
-    pub static ref COIN_MODULE: ModuleId =
-        { ModuleId::new(account_config::core_code_address(), Identifier::new("LibraCoin").unwrap()) };
-    /// The ModuleId for the Event
-    pub static ref EVENT_MODULE: ModuleId =
-        { ModuleId::new(account_config::core_code_address(), Identifier::new("Event").unwrap()) };
-    /// The ModuleId for the validator config
-    pub static ref VALIDATOR_CONFIG_MODULE: ModuleId =
-        { ModuleId::new(account_config::core_code_address(), Identifier::new("ValidatorConfig").unwrap()) };
-    /// The ModuleId for the libra system module
-    pub static ref LIBRA_SYSTEM_MODULE: ModuleId =
-        { ModuleId::new(account_config::core_code_address(), Identifier::new("LibraSystem").unwrap()) };
-}
-
-// Names for special functions.
-lazy_static! {
-    static ref PROLOGUE_NAME: Identifier = Identifier::new("prologue").unwrap();
-    static ref EPILOGUE_NAME: Identifier = Identifier::new("epilogue").unwrap();
-    static ref CREATE_ACCOUNT_NAME: Identifier = Identifier::new("make").unwrap();
-    static ref ACCOUNT_STRUCT_NAME: Identifier = Identifier::new("T").unwrap();
-    static ref EMIT_EVENT_NAME: Identifier = Identifier::new("write_to_event_store").unwrap();
-}
 
 /// A struct that executes one single transaction.
 /// 'alloc is the lifetime for the code cache, which is the argument type P here. Hence the P should
@@ -107,46 +67,6 @@ impl<'txn> TransactionExecutor<'txn> {
         )
     }
 
-    /// Run the prologue of a transaction by calling into `PROLOGUE_NAME` function stored
-    /// in the `ACCOUNT_MODULE` on chain.
-    pub(crate) fn run_prologue(
-        &mut self,
-        runtime: &VMRuntime,
-        state_view: &dyn StateView,
-    ) -> VMResult<()> {
-        record_stats! {time_hist | TXN_PROLOGUE_TIME_TAKEN | {
-            runtime.execute_function(
-                state_view,
-                &mut self.interpreter_context,
-                &self.txn_data,
-                &CostTable::zero(),
-                &ACCOUNT_MODULE,
-                &PROLOGUE_NAME,
-                vec![],
-                )?;
-            }
-        };
-        Ok(())
-    }
-
-    /// Run the epilogue of a transaction by calling into `EPILOGUE_NAME` function stored
-    /// in the `ACCOUNT_MODULE` on chain.
-    fn run_epilogue(&mut self, runtime: &VMRuntime, state_view: &dyn StateView) -> VMResult<()> {
-        record_stats! {time_hist | TXN_EPILOGUE_TIME_TAKEN | {
-            runtime.execute_function(
-                state_view,
-                &mut self.interpreter_context,
-                &self.txn_data,
-                &CostTable::zero(),
-                &ACCOUNT_MODULE,
-                &EPILOGUE_NAME,
-                vec![],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
     /// Execute a function.
     /// `module` is an identifier for the name the module is stored in. `function_name` is the name
     /// of the function. If such function is found, the VM will execute this function with arguments
@@ -171,41 +91,6 @@ impl<'txn> TransactionExecutor<'txn> {
         )
     }
 
-    /// Entrypoint into the interpreter. All external calls need to be routed through this
-    /// function.
-    pub(crate) fn execute_script(
-        &mut self,
-        runtime: &VMRuntime,
-        state_view: &dyn StateView,
-        script: Vec<u8>,
-        args: Vec<TransactionArgument>,
-    ) -> VMResult<()> {
-        runtime.execute_script(
-            state_view,
-            &mut self.interpreter_context,
-            &self.txn_data,
-            &self.gas_schedule,
-            script,
-            convert_txn_args(args),
-        )
-    }
-
-    /// Verifies that a `CompiledModule` is valid and returns the `ModuleId` if successful.
-    pub(crate) fn publish_module(
-        &mut self,
-        module: &[u8],
-        runtime: &VMRuntime,
-        state_view: &dyn StateView,
-    ) -> VMResult<ModuleId> {
-        runtime.publish_module(
-            module,
-            state_view,
-            &mut self.interpreter_context,
-            &self.txn_data,
-            self.gas_schedule,
-        )
-    }
-
     /// Execute a function with the sender set to `sender`, restoring the original sender afterward.
     /// This should only be used in the logic for generating the genesis block.
     #[allow(non_snake_case)]
@@ -223,59 +108,6 @@ impl<'txn> TransactionExecutor<'txn> {
         let res = self.execute_function(runtime, state_view, module, function_name, args);
         self.txn_data.sender = old_sender;
         res
-    }
-
-    /// Generate the TransactionOutput on failure. There can be two possibilities:
-    /// 1. The transaction encounters some runtime error, such as out of gas, arithmetic overflow,
-    /// etc. In this scenario, we are going to keep this transaction and charge proper gas to the
-    /// sender. 2. The transaction encounters VM invariant violation error type which indicates some
-    /// properties should have been guaranteed failed. Such transaction should be discarded for
-    /// sanity but this implies a bug in the VM that we should take care of.
-    pub(crate) fn failed_transaction_cleanup(
-        &mut self,
-        runtime: &VMRuntime,
-        state_view: &dyn StateView,
-        result: VMResult<()>,
-    ) -> TransactionOutput {
-        // Discard all the local writes, restart execution from a clean state.
-        self.clear();
-        match self.run_epilogue(runtime, state_view) {
-            Ok(_) => self
-                .make_write_set(vec![], result)
-                .unwrap_or_else(error_output),
-            // Running epilogue shouldn't fail here as we've already checked for enough balance in
-            // the prologue
-            Err(err) => error_output(err),
-        }
-    }
-
-    /// Clear all the writes local to this transaction.
-    fn clear(&mut self) {
-        self.interpreter_context.clear();
-    }
-
-    /// Generate the TransactionOutput for a successful transaction
-    pub(crate) fn transaction_cleanup(
-        &mut self,
-        runtime: &VMRuntime,
-        state_view: &dyn StateView,
-        to_be_published_modules: Vec<(ModuleId, Vec<u8>)>,
-    ) -> TransactionOutput {
-        // First run the epilogue
-        match self.run_epilogue(runtime, state_view) {
-            // If epilogue runs successfully, try to emit the writeset.
-            Ok(_) => match self.make_write_set(to_be_published_modules, Ok(())) {
-                // This step could fail if the program has dangling global reference
-                Ok(trans_out) => trans_out,
-                // In case of failure, run the cleanup code.
-                Err(err) => self.failed_transaction_cleanup(runtime, state_view, Err(err)),
-            },
-            // If the sender depleted its balance and can't pay for the gas, run the cleanup code.
-            Err(err) => match err.status_type() {
-                StatusType::InvariantViolation => error_output(err),
-                _ => self.failed_transaction_cleanup(runtime, state_view, Err(err)),
-            },
-        }
     }
 
     /// Produce a write set at the end of a transaction. This will clear all the local states in
@@ -311,17 +143,6 @@ impl<'txn> TransactionExecutor<'txn> {
     }
 }
 
-#[inline]
-fn error_output(err: VMStatus) -> TransactionOutput {
-    // Since this transaction will be discarded, no writeset will be included.
-    TransactionOutput::new(
-        WriteSet::default(),
-        vec![],
-        0,
-        TransactionStatus::Discard(err),
-    )
-}
-
 /// Convert the transaction arguments into move values.
 pub fn convert_txn_args(args: Vec<TransactionArgument>) -> Vec<Value> {
     args.into_iter()
@@ -330,42 +151,6 @@ pub fn convert_txn_args(args: Vec<TransactionArgument>) -> Vec<Value> {
             TransactionArgument::Address(a) => Value::address(a),
             TransactionArgument::Bool(b) => Value::bool(b),
             TransactionArgument::ByteArray(b) => Value::byte_array(b),
-            TransactionArgument::String(s) => Value::string(VMString::new(s)),
         })
         .collect()
-}
-
-/// Execute the first function in a module
-pub fn execute_function_in_module(
-    state_view: &dyn StateView,
-    module: VerifiedModule,
-    idx: FunctionDefinitionIndex,
-    args: Vec<TransactionArgument>,
-) -> VMResult<()> {
-    let module_id = module.as_inner().self_id();
-    let entry_name = {
-        let entry_func_idx = module.function_def_at(idx).function;
-        let entry_name_idx = module.function_handle_at(entry_func_idx).name;
-        module.identifier_at(entry_name_idx)
-    };
-    {
-        let arena = Arena::new();
-        let config = VMConfig {
-            publishing_options: VMPublishingOption::Open,
-        };
-        let mut runtime = VMRuntime::new(&arena, &config);
-        runtime.cache_module(module.clone());
-
-        let mut data_cache = BlockDataCache::new(state_view);
-        let gas_schedule = runtime.load_gas_schedule(&mut data_cache, state_view)?;
-        let mut txn_executor =
-            TransactionExecutor::new(&gas_schedule, &data_cache, TransactionMetadata::default());
-        txn_executor.execute_function(
-            &runtime,
-            state_view,
-            &module_id,
-            &entry_name,
-            convert_txn_args(args),
-        )
-    }
 }

@@ -8,7 +8,7 @@
 //! native function itself.
 use crate::file_format::{
     AddressPoolIndex, ByteArrayPoolIndex, Bytecode, FieldDefinitionIndex, FunctionHandleIndex,
-    StructDefinitionIndex, UserStringIndex, NO_TYPE_ACTUALS, NUMBER_OF_BYTECODE_INSTRUCTIONS,
+    StructDefinitionIndex, NO_TYPE_ACTUALS, NUMBER_OF_BYTECODE_INSTRUCTIONS,
     NUMBER_OF_NATIVE_FUNCTIONS,
 };
 pub use crate::file_format_common::Opcodes;
@@ -197,8 +197,12 @@ pub fn instruction_key(instruction: &Bytecode) -> u8 {
         BrTrue(_) => Opcodes::BR_TRUE,
         BrFalse(_) => Opcodes::BR_FALSE,
         Branch(_) => Opcodes::BRANCH,
-        LdConst(_) => Opcodes::LD_CONST,
-        LdStr(_) => Opcodes::LD_STR,
+        LdU8(_) => Opcodes::LD_U8,
+        LdU64(_) => Opcodes::LD_U64,
+        LdU128(_) => Opcodes::LD_U128,
+        CastU8 => Opcodes::CAST_U8,
+        CastU64 => Opcodes::CAST_U64,
+        CastU128 => Opcodes::CAST_U128,
         LdByteArray(_) => Opcodes::LD_BYTEARRAY,
         LdAddr(_) => Opcodes::LD_ADDR,
         LdTrue => Opcodes::LD_TRUE,
@@ -226,6 +230,8 @@ pub fn instruction_key(instruction: &Bytecode) -> u8 {
         BitOr => Opcodes::BIT_OR,
         BitAnd => Opcodes::BIT_AND,
         Xor => Opcodes::XOR,
+        Shl => Opcodes::SHL,
+        Shr => Opcodes::SHR,
         Or => Opcodes::OR,
         And => Opcodes::AND,
         Not => Opcodes::NOT,
@@ -252,7 +258,7 @@ pub fn instruction_key(instruction: &Bytecode) -> u8 {
 /// The cost tables, keyed by the serialized form of the bytecode instruction.  We use the
 /// serialized form as opposed to the instruction enum itself as the key since this will be the
 /// on-chain representation of bytecode instructions in the future.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CostTable {
     pub instruction_table: Vec<GasCost>,
     pub native_table: Vec<GasCost>,
@@ -354,14 +360,20 @@ impl CostTable {
             (StLoc(0), GasCost::new(0, 0)),
             (Ret, GasCost::new(0, 0)),
             (Lt, GasCost::new(0, 0)),
-            (LdConst(0), GasCost::new(0, 0)),
+            (LdU8(0), GasCost::new(0, 0)),
+            (LdU64(0), GasCost::new(0, 0)),
+            (LdU128(0), GasCost::new(0, 0)),
+            (CastU8, GasCost::new(0, 0)),
+            (CastU64, GasCost::new(0, 0)),
+            (CastU128, GasCost::new(0, 0)),
             (Abort, GasCost::new(0, 0)),
             (MutBorrowLoc(0), GasCost::new(0, 0)),
             (ImmBorrowLoc(0), GasCost::new(0, 0)),
-            (LdStr(UserStringIndex::new(0)), GasCost::new(0, 0)),
             (LdAddr(AddressPoolIndex::new(0)), GasCost::new(0, 0)),
             (Ge, GasCost::new(0, 0)),
             (Xor, GasCost::new(0, 0)),
+            (Shl, GasCost::new(0, 0)),
+            (Shr, GasCost::new(0, 0)),
             (Neq, GasCost::new(0, 0)),
             (Not, GasCost::new(0, 0)),
             (
@@ -416,7 +428,7 @@ impl CostTable {
 /// The  `GasCost` tracks:
 /// - instruction cost: how much time/computational power is needed to perform the instruction
 /// - memory cost: how much memory is required for the instruction, and storage overhead
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GasCost {
     pub instruction_gas: GasUnits<GasCarrier>,
     pub memory_gas: GasUnits<GasCarrier>,
@@ -445,6 +457,10 @@ pub fn words_in(size: AbstractMemorySize<GasCarrier>) -> AbstractMemorySize<GasC
     precondition!(size.get() <= MAX_ABSTRACT_MEMORY_SIZE.get() - (WORD_SIZE.get() + 1));
     // round-up div truncate
     size.map2(*WORD_SIZE, |size, word_size| {
+        // static invariant
+        assume!(word_size > 0);
+        // follows from the precondition
+        assume!(size <= u64::max_value() - word_size);
         (size + (word_size - 1)) / word_size
     })
 }
